@@ -1,0 +1,245 @@
+package courier
+
+import (
+	"context"
+	"crypto/tls"
+	"errors"
+	"fmt"
+	"log/slog"
+	"net/http"
+	"os"
+	"os/signal"
+	"strings"
+	"syscall"
+	"time"
+
+	"github.com/clerk/jack-service/proto/jackpb"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials"
+	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/protobuf/types/known/timestamppb"
+)
+
+const (
+	defaultShutdownTimeout = 10 * time.Second
+	defaultHealthPort      = "8080"
+)
+
+type courier struct {
+	driver  Driver
+	address string
+
+	shutdownTimeout time.Duration
+	logger          *slog.Logger
+	tlsOverride     *bool
+	grpcDialOpts    []grpc.DialOption
+
+	conn   *grpc.ClientConn
+	client jackpb.BackgroundJobsClient
+}
+
+// Main is the entry point for a courier service. It loads configuration
+// from environment variables, sets up the gRPC connection to jack-service,
+// starts a health check HTTP server, and runs the registered driver.
+//
+// Main blocks until a SIGINT or SIGTERM signal is received, then performs
+// a graceful shutdown.
+//
+// Required environment variables:
+//   - JACK_SERVICE_ADDR: jack-service gRPC address (e.g., "jack-service:50051")
+//
+// Optional environment variables:
+//   - PORT: health check HTTP server port (default "8080")
+//   - JACK_COURIER_SHUTDOWN_TIMEOUT: graceful shutdown timeout (default "10s")
+func Main(opts ...Option) {
+	os.Exit(run(opts...))
+}
+
+func run(opts ...Option) int {
+	driver := getDriver()
+	if driver == nil {
+		fmt.Fprintln(os.Stderr, "courier: no driver registered, call RegisterDriver before Main")
+		return 1
+	}
+
+	addr := os.Getenv("JACK_SERVICE_ADDR")
+	if addr == "" {
+		fmt.Fprintln(os.Stderr, "courier: JACK_SERVICE_ADDR environment variable is required")
+		return 1
+	}
+
+	c := &courier{
+		driver:          driver,
+		address:         addr,
+		shutdownTimeout: defaultShutdownTimeout,
+		logger:          slog.New(slog.NewJSONHandler(os.Stdout, nil)),
+	}
+
+	for _, opt := range opts {
+		if err := opt(c); err != nil {
+			fmt.Fprintf(os.Stderr, "courier: option error: %v\n", err)
+			return 1
+		}
+	}
+
+	if t := os.Getenv("JACK_COURIER_SHUTDOWN_TIMEOUT"); t != "" {
+		d, err := time.ParseDuration(t)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "courier: invalid JACK_COURIER_SHUTDOWN_TIMEOUT: %v\n", err)
+			return 1
+		}
+		c.shutdownTimeout = d
+	}
+
+	if err := c.connect(); err != nil {
+		c.logger.Error("failed to connect to jack-service", slog.String("error", err.Error()))
+		return 1
+	}
+	defer c.conn.Close()
+
+	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer cancel()
+
+	// Start health check HTTP server.
+	port := os.Getenv("PORT")
+	if port == "" {
+		port = defaultHealthPort
+	}
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /health", func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("OK"))
+	})
+
+	server := &http.Server{
+		Addr:    ":" + port,
+		Handler: mux,
+	}
+
+	go func() {
+		c.logger.Info("health server started", slog.String("addr", server.Addr))
+		if err := server.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			c.logger.Error("health server error", slog.String("error", err.Error()))
+		}
+	}()
+
+	c.logger.Info("courier started",
+		slog.String("jack_service_addr", c.address),
+		slog.String("health_port", port),
+	)
+
+	// Run the driver with the submit callback. This blocks until
+	// the context is cancelled or the driver returns an error.
+	err := c.driver.Run(ctx, c.submit)
+
+	// Graceful shutdown.
+	cancel()
+
+	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), c.shutdownTimeout)
+	defer shutdownCancel()
+
+	if shutdownErr := server.Shutdown(shutdownCtx); shutdownErr != nil {
+		c.logger.Error("health server shutdown error", slog.String("error", shutdownErr.Error()))
+	}
+
+	if err != nil && !errors.Is(err, context.Canceled) {
+		c.logger.Error("driver exited with error", slog.String("error", err.Error()))
+		return 1
+	}
+
+	c.logger.Info("courier stopped")
+	return 0
+}
+
+// submit delivers a batch of jobs to jack-service via EnqueueBulk.
+func (c *courier) submit(ctx context.Context, jobs []Job) ([]SubmitResult, error) {
+	if len(jobs) == 0 {
+		return nil, nil
+	}
+
+	req := buildBulkRequest(jobs)
+
+	resp, err := c.client.EnqueueBulk(ctx, req)
+	if err != nil {
+		return nil, fmt.Errorf("courier: EnqueueBulk: %w", err)
+	}
+
+	results := collectResults(jobs, resp, c.logger)
+	return results, nil
+}
+
+// buildBulkRequest converts a slice of Job to an EnqueueBulkRequest.
+func buildBulkRequest(jobs []Job) *jackpb.EnqueueBulkRequest {
+	reqs := make([]*jackpb.EnqueueRequest, len(jobs))
+	for i, j := range jobs {
+		req := &jackpb.EnqueueRequest{
+			ProducerId: j.ProducerID,
+			JobType:    j.JobType,
+			Payload:    j.Payload,
+			TraceId:    j.TraceID,
+		}
+		if !j.RunAt.IsZero() {
+			req.RunAt = timestamppb.New(j.RunAt)
+		}
+		reqs[i] = req
+	}
+	return &jackpb.EnqueueBulkRequest{Jobs: reqs}
+}
+
+// collectResults maps BulkResult entries back to SubmitResults using the
+// index to recover the CorrelationID from the original job slice.
+func collectResults(jobs []Job, resp *jackpb.EnqueueBulkResponse, logger *slog.Logger) []SubmitResult {
+	if resp == nil {
+		return nil
+	}
+
+	results := make([]SubmitResult, 0, len(resp.Results))
+	for _, r := range resp.Results {
+		idx := int(r.Index)
+		if idx < 0 || idx >= len(jobs) {
+			logger.Error("bulk result has out-of-range index",
+				slog.Int("index", idx),
+				slog.Int("jobs_count", len(jobs)),
+			)
+			continue
+		}
+
+		results = append(results, SubmitResult{
+			CorrelationID: jobs[idx].CorrelationID,
+			JobID:         r.JobId,
+			Err:           r.Error,
+		})
+	}
+	return results
+}
+
+// connect establishes the gRPC connection to jack-service.
+func (c *courier) connect() error {
+	useTLS := c.shouldUseTLS()
+
+	var transportCreds grpc.DialOption
+	if useTLS {
+		transportCreds = grpc.WithTransportCredentials(credentials.NewTLS(&tls.Config{}))
+	} else {
+		transportCreds = grpc.WithTransportCredentials(insecure.NewCredentials())
+	}
+
+	dialOpts := append([]grpc.DialOption{transportCreds}, c.grpcDialOpts...)
+
+	conn, err := grpc.NewClient(c.address, dialOpts...)
+	if err != nil {
+		return err
+	}
+
+	c.conn = conn
+	c.client = jackpb.NewBackgroundJobsClient(conn)
+	return nil
+}
+
+func (c *courier) shouldUseTLS() bool {
+	if c.tlsOverride != nil {
+		return *c.tlsOverride
+	}
+	return strings.HasSuffix(c.address, ":443")
+}

@@ -1,0 +1,37 @@
+# Cloud Build configuration for publishing jack-courier-lib to Artifact Registry.
+#
+# Triggered by pushing a semver tag (e.g. v0.1.0).
+# Publishes the Go module to the go-modules AR repository.
+steps:
+  - id: publish-go-module
+    name: golang:1.25.0-bookworm
+    entrypoint: bash
+    args:
+      - -c
+      - |
+        set -e
+
+        # Install gcloud + AR upload tool
+        apt-get update -qq && apt-get install -y -qq apt-transport-https ca-certificates gnupg curl
+        curl -fsSL https://packages.cloud.google.com/apt/doc/apt-key.gpg | gpg --dearmor -o /usr/share/keyrings/cloud.google.gpg
+        echo "deb [signed-by=/usr/share/keyrings/cloud.google.gpg] https://packages.cloud.google.com/apt cloud-sdk main" > /etc/apt/sources.list.d/google-cloud-sdk.list
+        apt-get update -qq && apt-get install -y -qq google-cloud-cli google-cloud-sdk-package-go-module
+
+        # Upload module to Artifact Registry
+        gcloud artifacts go upload \
+          --project=${PROJECT_ID} \
+          --repository=${_GO_REPOSITORY} \
+          --location=${_REGION} \
+          --module-path=github.com/clerk/jack-courier-lib \
+          --version=${TAG_NAME} \
+          --source=.
+
+substitutions:
+  _REGION: us-central1
+  _GO_REPOSITORY: go-modules
+
+options:
+  logging: CLOUD_LOGGING_ONLY
+  dynamicSubstitutions: true
+
+timeout: 600s
