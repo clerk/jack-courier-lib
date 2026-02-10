@@ -61,6 +61,24 @@ func startMockServer(t *testing.T, srv *mockBackgroundJobsServer) *grpc.ClientCo
 	return conn
 }
 
+// echoCorrelationServer returns a mock server that echoes CorrelationId
+// and assigns a job ID based on the job type.
+func echoCorrelationServer() *mockBackgroundJobsServer {
+	return &mockBackgroundJobsServer{
+		enqueueBulkFn: func(_ context.Context, req *jackpb.EnqueueBulkRequest) (*jackpb.EnqueueBulkResponse, error) {
+			results := make([]*jackpb.BulkResult, len(req.Jobs))
+			for i, j := range req.Jobs {
+				results[i] = &jackpb.BulkResult{
+					Index:         int32(i),
+					JobId:         "pjob_" + j.JobType,
+					CorrelationId: j.CorrelationId,
+				}
+			}
+			return &jackpb.EnqueueBulkResponse{Results: results}, nil
+		},
+	}
+}
+
 // --- Tests ---
 
 func TestBuildBulkRequest(t *testing.T) {
@@ -109,29 +127,29 @@ func TestBuildBulkRequest(t *testing.T) {
 	if j0.TraceId != "trace-123" {
 		t.Errorf("expected TraceId=trace-123, got %s", j0.TraceId)
 	}
+	if j0.CorrelationId != "corr-1" {
+		t.Errorf("expected CorrelationId=corr-1, got %s", j0.CorrelationId)
+	}
 
 	// Second job: zero RunAt should not set timestamp
 	j1 := req.Jobs[1]
 	if j1.RunAt != nil {
 		t.Errorf("expected RunAt to be nil for zero time, got %v", j1.RunAt)
 	}
+	if j1.CorrelationId != "corr-2" {
+		t.Errorf("expected CorrelationId=corr-2, got %s", j1.CorrelationId)
+	}
 }
 
 func TestCollectResults_FullSuccess(t *testing.T) {
-	jobs := []Job{
-		{CorrelationID: "corr-1"},
-		{CorrelationID: "corr-2"},
-	}
-
 	resp := &jackpb.EnqueueBulkResponse{
 		Results: []*jackpb.BulkResult{
-			{Index: 0, JobId: "pjob_aaa", Error: ""},
-			{Index: 1, JobId: "pjob_bbb", Error: ""},
+			{Index: 0, JobId: "pjob_aaa", CorrelationId: "corr-1"},
+			{Index: 1, JobId: "pjob_bbb", CorrelationId: "corr-2"},
 		},
 	}
 
-	logger := slog.Default()
-	results := collectResults(jobs, resp, logger)
+	results := collectResults(resp)
 
 	if len(results) != 2 {
 		t.Fatalf("expected 2 results, got %d", len(results))
@@ -146,28 +164,20 @@ func TestCollectResults_FullSuccess(t *testing.T) {
 }
 
 func TestCollectResults_PartialFailure(t *testing.T) {
-	jobs := []Job{
-		{CorrelationID: "corr-1"},
-		{CorrelationID: "corr-2"},
-		{CorrelationID: "corr-3"},
-	}
-
 	resp := &jackpb.EnqueueBulkResponse{
 		Results: []*jackpb.BulkResult{
-			{Index: 0, JobId: "pjob_aaa", Error: ""},
-			{Index: 1, JobId: "", Error: "unknown job type"},
-			{Index: 2, JobId: "pjob_ccc", Error: ""},
+			{Index: 0, JobId: "pjob_aaa", CorrelationId: "corr-1"},
+			{Index: 1, Error: "unknown job type", CorrelationId: "corr-2"},
+			{Index: 2, JobId: "pjob_ccc", CorrelationId: "corr-3"},
 		},
 	}
 
-	logger := slog.Default()
-	results := collectResults(jobs, resp, logger)
+	results := collectResults(resp)
 
 	if len(results) != 3 {
 		t.Fatalf("expected 3 results, got %d", len(results))
 	}
 
-	// First succeeded
 	if results[0].Err != "" {
 		t.Errorf("expected result[0] success, got err=%s", results[0].Err)
 	}
@@ -175,7 +185,6 @@ func TestCollectResults_PartialFailure(t *testing.T) {
 		t.Errorf("expected CorrelationID=corr-1, got %s", results[0].CorrelationID)
 	}
 
-	// Second failed
 	if results[1].Err != "unknown job type" {
 		t.Errorf("expected result[1] error, got err=%s", results[1].Err)
 	}
@@ -183,39 +192,13 @@ func TestCollectResults_PartialFailure(t *testing.T) {
 		t.Errorf("expected CorrelationID=corr-2, got %s", results[1].CorrelationID)
 	}
 
-	// Third succeeded
 	if results[2].Err != "" {
 		t.Errorf("expected result[2] success, got err=%s", results[2].Err)
 	}
 }
 
-func TestCollectResults_OutOfRangeIndex(t *testing.T) {
-	jobs := []Job{
-		{CorrelationID: "corr-1"},
-	}
-
-	resp := &jackpb.EnqueueBulkResponse{
-		Results: []*jackpb.BulkResult{
-			{Index: 0, JobId: "pjob_aaa"},
-			{Index: 5, JobId: "pjob_bad"}, // out of range
-		},
-	}
-
-	logger := slog.Default()
-	results := collectResults(jobs, resp, logger)
-
-	// Out-of-range index should be skipped
-	if len(results) != 1 {
-		t.Fatalf("expected 1 result (out-of-range skipped), got %d", len(results))
-	}
-	if results[0].CorrelationID != "corr-1" {
-		t.Errorf("expected CorrelationID=corr-1, got %s", results[0].CorrelationID)
-	}
-}
-
 func TestCollectResults_NilResponse(t *testing.T) {
-	jobs := []Job{{CorrelationID: "corr-1"}}
-	results := collectResults(jobs, nil, slog.Default())
+	results := collectResults(nil)
 	if results != nil {
 		t.Errorf("expected nil results for nil response, got %v", results)
 	}
@@ -245,20 +228,7 @@ func TestShouldUseTLS(t *testing.T) {
 }
 
 func TestSubmit_FullSuccess(t *testing.T) {
-	srv := &mockBackgroundJobsServer{
-		enqueueBulkFn: func(_ context.Context, req *jackpb.EnqueueBulkRequest) (*jackpb.EnqueueBulkResponse, error) {
-			results := make([]*jackpb.BulkResult, len(req.Jobs))
-			for i := range req.Jobs {
-				results[i] = &jackpb.BulkResult{
-					Index: int32(i),
-					JobId: "pjob_" + req.Jobs[i].JobType,
-				}
-			}
-			return &jackpb.EnqueueBulkResponse{Results: results}, nil
-		},
-	}
-
-	conn := startMockServer(t, srv)
+	conn := startMockServer(t, echoCorrelationServer())
 	c := &courier{
 		client: jackpb.NewBackgroundJobsClient(conn),
 		logger: slog.Default(),
@@ -291,8 +261,8 @@ func TestSubmit_PartialFailure(t *testing.T) {
 		enqueueBulkFn: func(_ context.Context, req *jackpb.EnqueueBulkRequest) (*jackpb.EnqueueBulkResponse, error) {
 			return &jackpb.EnqueueBulkResponse{
 				Results: []*jackpb.BulkResult{
-					{Index: 0, JobId: "pjob_ok"},
-					{Index: 1, Error: "invalid job type"},
+					{Index: 0, JobId: "pjob_ok", CorrelationId: req.Jobs[0].CorrelationId},
+					{Index: 1, Error: "invalid job type", CorrelationId: req.Jobs[1].CorrelationId},
 				},
 			}, nil
 		},
@@ -320,6 +290,9 @@ func TestSubmit_PartialFailure(t *testing.T) {
 
 	if results[0].Err != "" {
 		t.Errorf("expected result[0] success, got err=%s", results[0].Err)
+	}
+	if results[0].CorrelationID != "c1" {
+		t.Errorf("expected CorrelationID=c1, got %s", results[0].CorrelationID)
 	}
 	if results[1].Err != "invalid job type" {
 		t.Errorf("expected result[1] error='invalid job type', got err=%s", results[1].Err)
@@ -366,7 +339,6 @@ func TestSubmit_EmptyJobs(t *testing.T) {
 }
 
 func TestRegisterDriver_Panics(t *testing.T) {
-	// Reset global state for this test.
 	driverMu.Lock()
 	origDriver := registeredDriver
 	origRegistered := driverRegistered
@@ -381,10 +353,8 @@ func TestRegisterDriver_Panics(t *testing.T) {
 		driverMu.Unlock()
 	}()
 
-	// First registration should succeed.
 	RegisterDriver(&noopDriver{})
 
-	// Second registration should panic.
 	defer func() {
 		r := recover()
 		if r == nil {

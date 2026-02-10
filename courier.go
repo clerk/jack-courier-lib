@@ -165,7 +165,7 @@ func (c *courier) submit(ctx context.Context, jobs []Job) ([]SubmitResult, error
 		return nil, fmt.Errorf("courier: EnqueueBulk: %w", err)
 	}
 
-	results := collectResults(jobs, resp, c.logger)
+	results := collectResults(resp)
 	return results, nil
 }
 
@@ -174,10 +174,11 @@ func buildBulkRequest(jobs []Job) *jackpb.EnqueueBulkRequest {
 	reqs := make([]*jackpb.EnqueueRequest, len(jobs))
 	for i, j := range jobs {
 		req := &jackpb.EnqueueRequest{
-			ProducerId: j.ProducerID,
-			JobType:    j.JobType,
-			Payload:    j.Payload,
-			TraceId:    j.TraceID,
+			ProducerId:    j.ProducerID,
+			JobType:       j.JobType,
+			Payload:       j.Payload,
+			TraceId:       j.TraceID,
+			CorrelationId: j.CorrelationID,
 		}
 		if !j.RunAt.IsZero() {
 			req.RunAt = timestamppb.New(j.RunAt)
@@ -187,29 +188,20 @@ func buildBulkRequest(jobs []Job) *jackpb.EnqueueBulkRequest {
 	return &jackpb.EnqueueBulkRequest{Jobs: reqs}
 }
 
-// collectResults maps BulkResult entries back to SubmitResults using the
-// index to recover the CorrelationID from the original job slice.
-func collectResults(jobs []Job, resp *jackpb.EnqueueBulkResponse, logger *slog.Logger) []SubmitResult {
+// collectResults maps BulkResult entries to SubmitResults.
+// CorrelationID is echoed directly from the proto response.
+func collectResults(resp *jackpb.EnqueueBulkResponse) []SubmitResult {
 	if resp == nil {
 		return nil
 	}
 
-	results := make([]SubmitResult, 0, len(resp.Results))
-	for _, r := range resp.Results {
-		idx := int(r.Index)
-		if idx < 0 || idx >= len(jobs) {
-			logger.Error("bulk result has out-of-range index",
-				slog.Int("index", idx),
-				slog.Int("jobs_count", len(jobs)),
-			)
-			continue
-		}
-
-		results = append(results, SubmitResult{
-			CorrelationID: jobs[idx].CorrelationID,
+	results := make([]SubmitResult, len(resp.Results))
+	for i, r := range resp.Results {
+		results[i] = SubmitResult{
+			CorrelationID: r.CorrelationId,
 			JobID:         r.JobId,
 			Err:           r.Error,
-		})
+		}
 	}
 	return results
 }

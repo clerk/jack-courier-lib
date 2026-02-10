@@ -3,7 +3,7 @@ module github.com/clerk/jack-courier-lib
 go 1.25.6
 
 require (
-	github.com/clerk/jack-service/proto/jackpb v0.2.1
+	github.com/clerk/jack-service/proto/jackpb v0.2.2
 	google.golang.org/grpc v1.64.1
 	google.golang.org/protobuf v1.36.5
 )
