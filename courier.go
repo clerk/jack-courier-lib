@@ -13,6 +13,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/DataDog/datadog-go/v5/statsd"
 	"github.com/clerk/jack-service/proto/jackpb"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials"
@@ -33,6 +34,7 @@ type courier struct {
 	logger          *slog.Logger
 	tlsOverride     *bool
 	grpcDialOpts    []grpc.DialOption
+	statsd          statsd.ClientInterface
 
 	conn   *grpc.ClientConn
 	client jackpb.BackgroundJobsClient
@@ -80,6 +82,10 @@ func run(opts ...Option) int {
 			fmt.Fprintf(os.Stderr, "courier: option error: %v\n", err)
 			return 1
 		}
+	}
+
+	if c.statsd == nil {
+		c.statsd = &statsd.NoOpClient{}
 	}
 
 	if t := os.Getenv("JACK_COURIER_SHUTDOWN_TIMEOUT"); t != "" {
@@ -160,12 +166,30 @@ func (c *courier) submit(ctx context.Context, jobs []Job) ([]SubmitResult, error
 
 	req := buildBulkRequest(jobs)
 
+	start := time.Now()
 	resp, err := c.client.EnqueueBulk(ctx, req)
 	if err != nil {
+		_ = c.statsd.Incr("jack.courier.submit.count", []string{"status:error"}, 1)
 		return nil, fmt.Errorf("courier: EnqueueBulk: %w", err)
 	}
 
+	_ = c.statsd.Incr("jack.courier.submit.count", []string{"status:success"}, 1)
+	_ = c.statsd.Distribution("jack.courier.submit.duration", time.Since(start).Seconds(), nil, 1)
+	_ = c.statsd.Distribution("jack.courier.submit.batch_size", float64(len(jobs)), nil, 1)
+
 	results := collectResults(resp)
+
+	var failCount int
+	for _, r := range results {
+		if r.Err != "" {
+			failCount++
+		}
+	}
+	_ = c.statsd.Count("jack.courier.submit.jobs", int64(len(results)-failCount), []string{"status:success"}, 1)
+	if failCount > 0 {
+		_ = c.statsd.Count("jack.courier.submit.jobs", int64(failCount), []string{"status:error"}, 1)
+	}
+
 	return results, nil
 }
 

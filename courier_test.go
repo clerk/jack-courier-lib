@@ -7,6 +7,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/DataDog/datadog-go/v5/statsd"
 	"github.com/clerk/jack-service/proto/jackpb"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
@@ -232,6 +233,7 @@ func TestSubmit_FullSuccess(t *testing.T) {
 	c := &courier{
 		client: jackpb.NewBackgroundJobsClient(conn),
 		logger: slog.Default(),
+		statsd: &statsd.NoOpClient{},
 	}
 
 	jobs := []Job{
@@ -272,6 +274,7 @@ func TestSubmit_PartialFailure(t *testing.T) {
 	c := &courier{
 		client: jackpb.NewBackgroundJobsClient(conn),
 		logger: slog.Default(),
+		statsd: &statsd.NoOpClient{},
 	}
 
 	jobs := []Job{
@@ -313,6 +316,7 @@ func TestSubmit_GRPCError(t *testing.T) {
 	c := &courier{
 		client: jackpb.NewBackgroundJobsClient(conn),
 		logger: slog.Default(),
+		statsd: &statsd.NoOpClient{},
 	}
 
 	jobs := []Job{{CorrelationID: "c1", ProducerID: "prod_1", JobType: "email"}}

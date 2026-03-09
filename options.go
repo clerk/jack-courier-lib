@@ -5,6 +5,7 @@ import (
 	"log/slog"
 	"time"
 
+	"github.com/DataDog/datadog-go/v5/statsd"
 	"google.golang.org/grpc"
 )
 
@@ -35,6 +36,17 @@ func WithTLS(enabled bool) Option {
 func WithGRPCDialOptions(opts ...grpc.DialOption) Option {
 	return func(c *courier) error {
 		c.grpcDialOpts = append(c.grpcDialOpts, opts...)
+		return nil
+	}
+}
+
+// WithStatsd sets the DogStatsD client for metrics. Defaults to a no-op client.
+func WithStatsd(sd statsd.ClientInterface) Option {
+	return func(c *courier) error {
+		if sd == nil {
+			return fmt.Errorf("courier: statsd client must not be nil")
+		}
+		c.statsd = sd
 		return nil
 	}
 }
