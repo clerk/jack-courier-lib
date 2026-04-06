@@ -1,6 +1,6 @@
 module github.com/clerk/jack-courier-lib
 
-go 1.25.6
+go 1.25.0
 
 require (
 	github.com/DataDog/datadog-go/v5 v5.8.3
