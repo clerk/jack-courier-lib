@@ -18,6 +18,7 @@ import (
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/grpc/metadata"
 	"google.golang.org/protobuf/types/known/timestamppb"
 )
 
@@ -158,10 +159,44 @@ func run(opts ...Option) int {
 	return 0
 }
 
-// submit delivers a batch of jobs to jack-service via EnqueueBulk.
+// submit delivers a batch of jobs to jack-service via EnqueueBulk. Jobs
+// are split by Shadow status because the shadow flag is conveyed in
+// gRPC metadata at the call level, not per-row.
 func (c *courier) submit(ctx context.Context, jobs []Job) ([]SubmitResult, error) {
 	if len(jobs) == 0 {
 		return nil, nil
+	}
+
+	var normal, shadow []Job
+	for _, j := range jobs {
+		if j.Shadow {
+			shadow = append(shadow, j)
+		} else {
+			normal = append(normal, j)
+		}
+	}
+
+	var results []SubmitResult
+	if len(normal) > 0 {
+		r, err := c.submitBatch(ctx, normal, false)
+		if err != nil {
+			return nil, err
+		}
+		results = append(results, r...)
+	}
+	if len(shadow) > 0 {
+		r, err := c.submitBatch(ctx, shadow, true)
+		if err != nil {
+			return nil, err
+		}
+		results = append(results, r...)
+	}
+	return results, nil
+}
+
+func (c *courier) submitBatch(ctx context.Context, jobs []Job, shadow bool) ([]SubmitResult, error) {
+	if shadow {
+		ctx = metadata.AppendToOutgoingContext(ctx, "shadow", "true")
 	}
 
 	req := buildBulkRequest(jobs)
