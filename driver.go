@@ -27,6 +27,10 @@ type Job struct {
 
 	// TraceID is an optional distributed tracing correlation ID.
 	TraceID string
+
+	// Shadow marks the job for ack-without-execute at the worker. Used
+	// during migration to validate the pipeline without side effects.
+	Shadow bool
 }
 
 // SubmitResult represents the outcome of submitting a single job to jack-service.
