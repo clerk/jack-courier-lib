@@ -43,6 +43,11 @@ type SubmitResult struct {
 
 	// Err is non-empty if this job failed to enqueue.
 	Err string
+
+	// Reason is the rejection class from jack-service, set only when
+	// Err is non-empty. Values: "validation_error", "payload_too_large",
+	// "internal_error".
+	Reason string
 }
 
 // SubmitFunc delivers a batch of jobs to jack-service and returns per-job results.
@@ -66,9 +71,9 @@ type Driver interface {
 }
 
 var (
-	driverMu          sync.Mutex
-	registeredDriver  Driver
-	driverRegistered  bool
+	driverMu         sync.Mutex
+	registeredDriver Driver
+	driverRegistered bool
 )
 
 // RegisterDriver registers a Driver to be used by Main.
