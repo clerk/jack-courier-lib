@@ -260,6 +260,7 @@ func collectResults(resp *jackpb.EnqueueBulkResponse) []SubmitResult {
 			CorrelationID: r.CorrelationId,
 			JobID:         r.JobId,
 			Err:           r.Error,
+			Reason:        r.Reason,
 		}
 	}
 	return results

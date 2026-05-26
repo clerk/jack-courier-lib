@@ -169,7 +169,7 @@ func TestCollectResults_PartialFailure(t *testing.T) {
 	resp := &jackpb.EnqueueBulkResponse{
 		Results: []*jackpb.BulkResult{
 			{Index: 0, JobId: "pjob_aaa", CorrelationId: "corr-1"},
-			{Index: 1, Error: "unknown job type", CorrelationId: "corr-2"},
+			{Index: 1, Error: "unknown job type", Reason: "validation_error", CorrelationId: "corr-2"},
 			{Index: 2, JobId: "pjob_ccc", CorrelationId: "corr-3"},
 		},
 	}
@@ -189,6 +189,9 @@ func TestCollectResults_PartialFailure(t *testing.T) {
 
 	if results[1].Err != "unknown job type" {
 		t.Errorf("expected result[1] error, got err=%s", results[1].Err)
+	}
+	if results[1].Reason != "validation_error" {
+		t.Errorf("expected result[1] reason=validation_error, got %s", results[1].Reason)
 	}
 	if results[1].CorrelationID != "corr-2" {
 		t.Errorf("expected CorrelationID=corr-2, got %s", results[1].CorrelationID)
