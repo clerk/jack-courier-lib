@@ -2,8 +2,8 @@ github.com/DataDog/datadog-go/v5 v5.8.3 h1:s58CUJ9s8lezjhTNJO/SxkPBv2qZjS3ktpRSq
 github.com/DataDog/datadog-go/v5 v5.8.3/go.mod h1:K9kcYBlxkcPP8tvvjZZKs/m1edNAUFzBbdpTUKfCsuw=
 github.com/Microsoft/go-winio v0.5.0 h1:Elr9Wn+sGKPlkaBvwu4mTrxtmOp3F3yV9qhaHbXGjwU=
 github.com/Microsoft/go-winio v0.5.0/go.mod h1:JPGBdM1cNvN/6ISo+n8V5iA4v8pBzdOpzfwIujj1a84=
-github.com/clerk/jack-service/proto/jackpb v0.2.4 h1:8eNf6dkswILQdAvsHRM/BpqDZXq34yAKOKPG8sfSUF4=
-github.com/clerk/jack-service/proto/jackpb v0.2.4/go.mod h1:ZOPk49j4w4lEawaOAv/b5XZ3I6XYpFIOHmD3CviXJwE=
+github.com/clerk/jack-service/proto/jackpb v0.2.5 h1:Y1thIp9AsVxZYTdXlynNIaqzNU1U3vZXJqTxZXpge3o=
+github.com/clerk/jack-service/proto/jackpb v0.2.5/go.mod h1:ZOPk49j4w4lEawaOAv/b5XZ3I6XYpFIOHmD3CviXJwE=
 github.com/davecgh/go-spew v1.1.0/go.mod h1:J7Y8YcW2NihsgmVo/mv3lAwl/skON4iLHjSsI+c5H38=
 github.com/davecgh/go-spew v1.1.1 h1:vj9j/u1bqnvCEfJOwUhtlOARqs3+rkHYY13jYWTU97c=
 github.com/davecgh/go-spew v1.1.1/go.mod h1:J7Y8YcW2NihsgmVo/mv3lAwl/skON4iLHjSsI+c5H38=
