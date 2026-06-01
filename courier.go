@@ -238,6 +238,7 @@ func buildBulkRequest(jobs []Job) *jackpb.EnqueueBulkRequest {
 			Payload:       j.Payload,
 			TraceId:       j.TraceID,
 			CorrelationId: j.CorrelationID,
+			JobId:         j.ID,
 		}
 		if !j.RunAt.IsZero() {
 			req.RunAt = timestamppb.New(j.RunAt)

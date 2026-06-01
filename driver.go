@@ -13,6 +13,13 @@ type Job struct {
 	// enqueued (e.g., outbox row primary key, WAL LSN).
 	CorrelationID string
 
+	// ID is an optional caller-supplied job ID. When non-empty, jack-service
+	// uses it as the canonical job identifier instead of generating one
+	// server-side. Drivers (e.g., jack-courier-driver-pglg) populate this
+	// from the producer's payload so the producer-side ID is preserved
+	// end-to-end through the pipeline.
+	ID string
+
 	// ProducerID identifies the producer in jack-service.
 	ProducerID string
 

@@ -89,6 +89,7 @@ func TestBuildBulkRequest(t *testing.T) {
 	jobs := []Job{
 		{
 			CorrelationID: "corr-1",
+			ID:            "psjob_abc",
 			ProducerID:    "prod_abc",
 			JobType:       "send_email",
 			Payload:       []byte(`{"to":"user@example.com"}`),
@@ -99,7 +100,7 @@ func TestBuildBulkRequest(t *testing.T) {
 			CorrelationID: "corr-2",
 			ProducerID:    "prod_abc",
 			JobType:       "send_sms",
-			// RunAt zero = immediate
+			// ID + RunAt zero = jack generates ID, runs immediately
 		},
 	}
 
@@ -132,14 +133,42 @@ func TestBuildBulkRequest(t *testing.T) {
 	if j0.CorrelationId != "corr-1" {
 		t.Errorf("expected CorrelationId=corr-1, got %s", j0.CorrelationId)
 	}
+	if j0.JobId != "psjob_abc" {
+		t.Errorf("expected JobId=psjob_abc, got %s", j0.JobId)
+	}
 
-	// Second job: zero RunAt should not set timestamp
+	// Second job: zero RunAt should not set timestamp; empty ID stays empty
 	j1 := req.Jobs[1]
 	if j1.RunAt != nil {
 		t.Errorf("expected RunAt to be nil for zero time, got %v", j1.RunAt)
 	}
 	if j1.CorrelationId != "corr-2" {
 		t.Errorf("expected CorrelationId=corr-2, got %s", j1.CorrelationId)
+	}
+	if j1.JobId != "" {
+		t.Errorf("expected empty JobId (jack will generate), got %s", j1.JobId)
+	}
+}
+
+// TestBuildBulkRequestThreadsID is a focused regression test: Job.ID must
+// reach EnqueueRequest.JobId verbatim. This is the producer-side half of
+// PLAT-2887 — without it, the producer's psjob_<KSUID> never reaches
+// jack-service and legacy↔jack correlation by attribute fails.
+func TestBuildBulkRequestThreadsID(t *testing.T) {
+	jobs := []Job{
+		{ID: "psjob_alpha", ProducerID: "p", JobType: "t1", Payload: []byte(`{}`)},
+		{ID: "", ProducerID: "p", JobType: "t2", Payload: []byte(`{}`)},
+		{ID: "psjob_gamma", ProducerID: "p", JobType: "t3", Payload: []byte(`{}`)},
+	}
+
+	req := buildBulkRequest(jobs)
+	got := []string{req.Jobs[0].JobId, req.Jobs[1].JobId, req.Jobs[2].JobId}
+	want := []string{"psjob_alpha", "", "psjob_gamma"}
+
+	for i := range got {
+		if got[i] != want[i] {
+			t.Errorf("Jobs[%d].JobId = %q, want %q", i, got[i], want[i])
+		}
 	}
 }
 
