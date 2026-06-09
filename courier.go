@@ -89,6 +89,8 @@ func run(opts ...Option) int {
 		c.statsd = &statsd.NoOpClient{}
 	}
 
+	defer func() { _ = c.statsd.Flush() }()
+
 	if t := os.Getenv("JACK_COURIER_SHUTDOWN_TIMEOUT"); t != "" {
 		d, err := time.ParseDuration(t)
 		if err != nil {
