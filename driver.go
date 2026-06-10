@@ -58,16 +58,29 @@ type SubmitResult struct {
 }
 
 // SubmitFunc delivers a batch of jobs to jack-service and returns per-job results.
-// If the gRPC call itself fails, err is non-nil and results is nil.
+// Calling it with an empty jobs slice is a no-op and returns nil, nil.
+//
+// If the gRPC call itself fails, err is non-nil and results is nil. The driver
+// should probably retry or back off.
+//
 // On partial failure, results contains a mix of successful and failed entries.
+// Each result has a `CorrelationID` echoed from the submitted job.
 type SubmitFunc func(ctx context.Context, jobs []Job) ([]SubmitResult, error)
 
 // Driver sources jobs for delivery to jack-service. The courier calls
 // Driver.Run, passing a submit callback. The driver controls when and
 // how often to call submit — it owns the dispatch loop.
+//
+// When building a new driver, ensure it:
+// - Populates all required Job fields
+// - Handles gRPC errors from `submit` (e.g. retry with backoff)
+// - Handles per-job failures in `SubmitResult.Err` (retry, dead-letter, or log)
+// - Tracks delivery state so jobs are not re-submitted after success (e.g., advance WAL LSN, delete outbox rows, update cursor)
+// - Batches efficiently — larger batches reduce gRPC round-trips; smaller batches reduce latency
+// - Implements backpressure — if jack-service is slow or erroring, the driver should back off rather than flood it
 type Driver interface {
 	// Run starts the driver. The driver calls submit whenever it has a batch
-	// of jobs ready for delivery. Run blocks until ctx is cancelled or an
+	// of jobs ready for delivery. Run should exit when ctx is cancelled or an
 	// unrecoverable error occurs.
 	//
 	// The driver is responsible for:
