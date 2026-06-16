@@ -18,7 +18,6 @@ import (
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/credentials/insecure"
-	"google.golang.org/grpc/metadata"
 	"google.golang.org/protobuf/types/known/timestamppb"
 )
 
@@ -161,46 +160,18 @@ func run(opts ...Option) int {
 	return 0
 }
 
-// submit delivers a batch of jobs to jack-service via EnqueueBulk. Jobs
-// are split by Shadow status because the shadow flag is conveyed in
-// gRPC metadata at the call level, not per-row.
+// submit delivers a batch of jobs to jack-service via EnqueueBulk in a
+// single RPC. Per-job jack-service control fields (shadow, etc.) ride on
+// each job's InternalJackMeta bytes — no per-call gRPC metadata header,
+// no batch-splitting.
 func (c *courier) submit(ctx context.Context, jobs []Job) ([]SubmitResult, error) {
 	if len(jobs) == 0 {
 		return nil, nil
 	}
-
-	var normal, shadow []Job
-	for _, j := range jobs {
-		if j.Shadow {
-			shadow = append(shadow, j)
-		} else {
-			normal = append(normal, j)
-		}
-	}
-
-	var results []SubmitResult
-	if len(normal) > 0 {
-		r, err := c.submitBatch(ctx, normal, false)
-		if err != nil {
-			return nil, err
-		}
-		results = append(results, r...)
-	}
-	if len(shadow) > 0 {
-		r, err := c.submitBatch(ctx, shadow, true)
-		if err != nil {
-			return nil, err
-		}
-		results = append(results, r...)
-	}
-	return results, nil
+	return c.submitBatch(ctx, jobs)
 }
 
-func (c *courier) submitBatch(ctx context.Context, jobs []Job, shadow bool) ([]SubmitResult, error) {
-	if shadow {
-		ctx = metadata.AppendToOutgoingContext(ctx, "shadow", "true")
-	}
-
+func (c *courier) submitBatch(ctx context.Context, jobs []Job) ([]SubmitResult, error) {
 	req := buildBulkRequest(jobs)
 
 	start := time.Now()
@@ -235,12 +206,13 @@ func buildBulkRequest(jobs []Job) *jackpb.EnqueueBulkRequest {
 	reqs := make([]*jackpb.EnqueueRequest, len(jobs))
 	for i, j := range jobs {
 		req := &jackpb.EnqueueRequest{
-			ProducerId:    j.ProducerID,
-			JobType:       j.JobType,
-			Payload:       j.Payload,
-			TraceId:       j.TraceID,
-			CorrelationId: j.CorrelationID,
-			JobId:         j.ID,
+			ProducerId:       j.ProducerID,
+			JobType:          j.JobType,
+			Payload:          j.Payload,
+			TraceId:          j.TraceID,
+			CorrelationId:    j.CorrelationID,
+			JobId:            j.ID,
+			InternalJackMeta: j.InternalJackMeta,
 		}
 		if !j.RunAt.IsZero() {
 			req.RunAt = timestamppb.New(j.RunAt)

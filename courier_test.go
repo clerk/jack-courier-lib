@@ -11,7 +11,6 @@ import (
 	"github.com/clerk/jack-service/proto/jackpb"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
-	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/test/bufconn"
 )
 
@@ -363,28 +362,16 @@ func TestSubmit_GRPCError(t *testing.T) {
 	}
 }
 
-// recordedCall captures one EnqueueBulk invocation: the shadow metadata
-// header and the job CorrelationIDs in the batch.
-type recordedCall struct {
-	shadow         string
-	correlationIDs []string
-}
-
-func TestSubmit_SplitsShadowAndNormal(t *testing.T) {
-	var calls []recordedCall
+// TestSubmit_SingleBatchPassesThroughInternalJackMeta verifies the new
+// flow: per-job InternalJackMeta bytes flow into EnqueueRequest unchanged,
+// no batch splitting, no gRPC metadata header.
+func TestSubmit_SingleBatchPassesThroughInternalJackMeta(t *testing.T) {
+	var callCount int
+	var seen []*jackpb.EnqueueRequest
 	srv := &mockBackgroundJobsServer{
 		enqueueBulkFn: func(ctx context.Context, req *jackpb.EnqueueBulkRequest) (*jackpb.EnqueueBulkResponse, error) {
-			md, _ := metadata.FromIncomingContext(ctx)
-			ids := make([]string, len(req.Jobs))
-			for i, j := range req.Jobs {
-				ids[i] = j.CorrelationId
-			}
-			shadowHeader := ""
-			if v := md.Get("shadow"); len(v) > 0 {
-				shadowHeader = v[0]
-			}
-			calls = append(calls, recordedCall{shadow: shadowHeader, correlationIDs: ids})
-
+			callCount++
+			seen = append(seen, req.Jobs...)
 			results := make([]*jackpb.BulkResult, len(req.Jobs))
 			for i, j := range req.Jobs {
 				results[i] = &jackpb.BulkResult{Index: int32(i), CorrelationId: j.CorrelationId}
@@ -401,71 +388,28 @@ func TestSubmit_SplitsShadowAndNormal(t *testing.T) {
 	}
 
 	jobs := []Job{
-		{CorrelationID: "c1", ProducerID: "p", JobType: "email"},
-		{CorrelationID: "c2", ProducerID: "p", JobType: "sms", Shadow: true},
-		{CorrelationID: "c3", ProducerID: "p", JobType: "email"},
-		{CorrelationID: "c4", ProducerID: "p", JobType: "sms", Shadow: true},
+		{CorrelationID: "c1", ProducerID: "p", JobType: "email", InternalJackMeta: nil},
+		{CorrelationID: "c2", ProducerID: "p", JobType: "sms", InternalJackMeta: []byte{0xde, 0xad}},
+		{CorrelationID: "c3", ProducerID: "p", JobType: "email", InternalJackMeta: []byte{0xbe, 0xef}},
 	}
 
-	results, err := c.submit(context.Background(), jobs)
-	if err != nil {
-		t.Fatalf("submit: %v", err)
-	}
-	if len(results) != 4 {
-		t.Fatalf("expected 4 results, got %d", len(results))
-	}
-	if len(calls) != 2 {
-		t.Fatalf("expected 2 gRPC calls (one per shadow status), got %d", len(calls))
-	}
-
-	// Order: normal batch first, then shadow.
-	if calls[0].shadow != "" {
-		t.Errorf("first call should have no shadow metadata, got %q", calls[0].shadow)
-	}
-	if got := calls[0].correlationIDs; !equalStrings(got, []string{"c1", "c3"}) {
-		t.Errorf("first call should carry [c1 c3], got %v", got)
-	}
-	if calls[1].shadow != "true" {
-		t.Errorf("second call should have shadow=true, got %q", calls[1].shadow)
-	}
-	if got := calls[1].correlationIDs; !equalStrings(got, []string{"c2", "c4"}) {
-		t.Errorf("second call should carry [c2 c4], got %v", got)
-	}
-}
-
-func TestSubmit_AllShadow(t *testing.T) {
-	var calls []recordedCall
-	srv := &mockBackgroundJobsServer{
-		enqueueBulkFn: func(ctx context.Context, req *jackpb.EnqueueBulkRequest) (*jackpb.EnqueueBulkResponse, error) {
-			md, _ := metadata.FromIncomingContext(ctx)
-			shadow := ""
-			if v := md.Get("shadow"); len(v) > 0 {
-				shadow = v[0]
-			}
-			calls = append(calls, recordedCall{shadow: shadow, correlationIDs: []string{req.Jobs[0].CorrelationId}})
-			return &jackpb.EnqueueBulkResponse{
-				Results: []*jackpb.BulkResult{{Index: 0, CorrelationId: req.Jobs[0].CorrelationId}},
-			}, nil
-		},
-	}
-
-	conn := startMockServer(t, srv)
-	c := &courier{
-		client: jackpb.NewBackgroundJobsClient(conn),
-		logger: slog.Default(),
-		statsd: &statsd.NoOpClient{},
-	}
-
-	jobs := []Job{{CorrelationID: "c1", JobType: "email", Shadow: true}}
 	if _, err := c.submit(context.Background(), jobs); err != nil {
 		t.Fatalf("submit: %v", err)
 	}
-	if len(calls) != 1 || calls[0].shadow != "true" {
-		t.Fatalf("expected single shadow call, got %+v", calls)
+	if callCount != 1 {
+		t.Errorf("expected single batched RPC, got %d calls", callCount)
+	}
+	if len(seen) != 3 {
+		t.Fatalf("expected 3 jobs in the call, got %d", len(seen))
+	}
+	for i, want := range [][]byte{nil, {0xde, 0xad}, {0xbe, 0xef}} {
+		if !bytesEqual(seen[i].InternalJackMeta, want) {
+			t.Errorf("job %d: InternalJackMeta = %x, want %x", i, seen[i].InternalJackMeta, want)
+		}
 	}
 }
 
-func equalStrings(a, b []string) bool {
+func bytesEqual(a, b []byte) bool {
 	if len(a) != len(b) {
 		return false
 	}
