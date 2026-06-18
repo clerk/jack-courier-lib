@@ -38,3 +38,4 @@ func main() {
 ## Configuration
 
 - `JACK_COURIER_SUBMIT_TIMEOUT` — per-call deadline applied to each `EnqueueBulk` RPC, parsed as a Go duration (e.g. `30s`, `1m`). Defaults to `30s`. The driver's lifecycle context still controls overall shutdown; this only bounds an individual submit so a stalled jack-service cannot hang the courier.
+- `JACK_COURIER_SHUTDOWN_TIMEOUT` — graceful shutdown timeout, parsed as a Go duration. Defaults to `10s`. On `SIGINT`/`SIGTERM` this bounds total termination time. If the driver does not return within it, the driver is abandoned and the process exits anyway, so the courier never takes longer than the timeout to shut down.
