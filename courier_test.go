@@ -2,6 +2,7 @@ package courier
 
 import (
 	"context"
+	"errors"
 	"log/slog"
 	"net"
 	"testing"
@@ -10,7 +11,9 @@ import (
 	"github.com/DataDog/datadog-go/v5/statsd"
 	"github.com/clerk/jack-service/proto/jackpb"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/grpc/status"
 	"google.golang.org/grpc/test/bufconn"
 )
 
@@ -44,7 +47,7 @@ func startMockServer(t *testing.T, srv *mockBackgroundJobsServer) *grpc.ClientCo
 
 	t.Cleanup(func() {
 		s.GracefulStop()
-		lis.Close()
+		_ = lis.Close()
 	})
 
 	conn, err := grpc.NewClient(
@@ -57,7 +60,7 @@ func startMockServer(t *testing.T, srv *mockBackgroundJobsServer) *grpc.ClientCo
 	if err != nil {
 		t.Fatalf("failed to create bufconn client: %v", err)
 	}
-	t.Cleanup(func() { conn.Close() })
+	t.Cleanup(func() { _ = conn.Close() })
 
 	return conn
 }
@@ -359,6 +362,69 @@ func TestSubmit_GRPCError(t *testing.T) {
 	}
 	if results != nil {
 		t.Errorf("expected nil results on gRPC error, got %v", results)
+	}
+}
+
+func TestSubmit_TimesOutOnSlowJack(t *testing.T) {
+	srv := &mockBackgroundJobsServer{
+		enqueueBulkFn: func(ctx context.Context, _ *jackpb.EnqueueBulkRequest) (*jackpb.EnqueueBulkResponse, error) {
+			select {
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			case <-time.After(2 * time.Second):
+				return &jackpb.EnqueueBulkResponse{}, nil
+			}
+		},
+	}
+
+	conn := startMockServer(t, srv)
+	c := &courier{
+		client:        jackpb.NewBackgroundJobsClient(conn),
+		logger:        slog.Default(),
+		statsd:        &statsd.NoOpClient{},
+		submitTimeout: 100 * time.Millisecond,
+	}
+
+	jobs := []Job{{CorrelationID: "c1", ProducerID: "prod_1", JobType: "email"}}
+
+	_, err := c.submit(t.Context(), jobs)
+	if err == nil {
+		t.Fatal("expected timeout error from submit, got nil")
+	}
+	if !errors.Is(err, context.DeadlineExceeded) && status.Code(err) != codes.DeadlineExceeded {
+		t.Fatalf("expected deadline-exceeded error, got %v", err)
+	}
+}
+
+func TestParsePositiveDuration(t *testing.T) {
+	tests := []struct {
+		name    string
+		value   string
+		want    time.Duration
+		wantErr bool
+	}{
+		{"valid duration", "30s", 30 * time.Second, false},
+		{"zero is rejected", "0s", 0, true},
+		{"negative is rejected", "-5s", 0, true},
+		{"malformed is rejected", "nope", 0, true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := parsePositiveDuration("JACK_COURIER_SUBMIT_TIMEOUT", tt.value)
+			if tt.wantErr {
+				if err == nil {
+					t.Fatalf("expected error for %q, got nil", tt.value)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("unexpected error for %q: %v", tt.value, err)
+			}
+			if got != tt.want {
+				t.Errorf("parsePositiveDuration(%q) = %v, want %v", tt.value, got, tt.want)
+			}
+		})
 	}
 }
 

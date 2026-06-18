@@ -62,3 +62,17 @@ func WithShutdownTimeout(d time.Duration) Option {
 		return nil
 	}
 }
+
+// WithSubmitTimeout sets the per-call deadline applied to each EnqueueBulk
+// RPC. The driver's lifecycle context still controls overall shutdown.
+// This only affects an individual submit so a stalled jack-service cannot hang the
+// courier indefinitely. Defaults to 30 seconds.
+func WithSubmitTimeout(d time.Duration) Option {
+	return func(c *courier) error {
+		if d <= 0 {
+			return fmt.Errorf("courier: submit timeout must be > 0, got %s", d)
+		}
+		c.submitTimeout = d
+		return nil
+	}
+}
