@@ -35,9 +35,12 @@ type Job struct {
 	// TraceID is an optional distributed tracing correlation ID.
 	TraceID string
 
-	// Shadow marks the job for ack-without-execute at the worker. Used
-	// during migration to validate the pipeline without side effects.
-	Shadow bool
+	// InternalJackMeta carries the producer-supplied jack-service control
+	// header for this job. The driver reads the bytes from the producer's
+	// outbox row (a serialized jack.InternalJackMeta proto) and the courier
+	// ships them through to jack-service in EnqueueRequest.InternalJackMeta
+	// unchanged. Empty means no jack-service control fields are set.
+	InternalJackMeta []byte
 }
 
 // SubmitResult represents the outcome of submitting a single job to jack-service.
