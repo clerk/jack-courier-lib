@@ -15,7 +15,7 @@ clean:
 
 # Lint
 lint:
-	go vet ./...
+	golangci-lint run ./...
 
 # Use local jack-service proto instead of AR (for local development)
 dev:

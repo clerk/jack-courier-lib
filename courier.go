@@ -23,6 +23,7 @@ import (
 
 const (
 	defaultShutdownTimeout = 10 * time.Second
+	defaultSubmitTimeout   = 30 * time.Second
 	defaultHealthPort      = "8080"
 )
 
@@ -31,6 +32,7 @@ type courier struct {
 	address string
 
 	shutdownTimeout time.Duration
+	submitTimeout   time.Duration
 	logger          *slog.Logger
 	tlsOverride     *bool
 	grpcDialOpts    []grpc.DialOption
@@ -53,6 +55,7 @@ type courier struct {
 // Optional environment variables:
 //   - PORT: health check HTTP server port (default "8080")
 //   - JACK_COURIER_SHUTDOWN_TIMEOUT: graceful shutdown timeout (default "10s")
+//   - JACK_COURIER_SUBMIT_TIMEOUT: per-call EnqueueBulk timeout (default "30s")
 func Main(opts ...Option) {
 	os.Exit(run(opts...))
 }
@@ -74,6 +77,7 @@ func run(opts ...Option) int {
 		driver:          driver,
 		address:         addr,
 		shutdownTimeout: defaultShutdownTimeout,
+		submitTimeout:   defaultSubmitTimeout,
 		logger:          slog.New(slog.NewJSONHandler(os.Stdout, nil)),
 	}
 
@@ -90,20 +94,29 @@ func run(opts ...Option) int {
 
 	defer func() { _ = c.statsd.Flush() }()
 
-	if t := os.Getenv("JACK_COURIER_SHUTDOWN_TIMEOUT"); t != "" {
-		d, err := time.ParseDuration(t)
+	if v := os.Getenv("JACK_COURIER_SHUTDOWN_TIMEOUT"); v != "" {
+		d, err := parsePositiveDuration("JACK_COURIER_SHUTDOWN_TIMEOUT", v)
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "courier: invalid JACK_COURIER_SHUTDOWN_TIMEOUT: %v\n", err)
+			fmt.Fprintf(os.Stderr, "courier: %v\n", err)
 			return 1
 		}
 		c.shutdownTimeout = d
+	}
+
+	if v := os.Getenv("JACK_COURIER_SUBMIT_TIMEOUT"); v != "" {
+		d, err := parsePositiveDuration("JACK_COURIER_SUBMIT_TIMEOUT", v)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "courier: %v\n", err)
+			return 1
+		}
+		c.submitTimeout = d
 	}
 
 	if err := c.connect(); err != nil {
 		c.logger.Error("failed to connect to jack-service", slog.String("error", err.Error()))
 		return 1
 	}
-	defer c.conn.Close()
+	defer func() { _ = c.conn.Close() }()
 
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer cancel()
@@ -160,6 +173,17 @@ func run(opts ...Option) int {
 	return 0
 }
 
+func parsePositiveDuration(name, value string) (time.Duration, error) {
+	d, err := time.ParseDuration(value)
+	if err != nil {
+		return 0, fmt.Errorf("invalid %s: %w", name, err)
+	}
+	if d <= 0 {
+		return 0, fmt.Errorf("%s must be > 0, got %s", name, d)
+	}
+	return d, nil
+}
+
 // submit delivers a batch of jobs to jack-service via EnqueueBulk in a
 // single RPC. Per-job jack-service control fields (shadow, etc.) ride on
 // each job's InternalJackMeta bytes — no per-call gRPC metadata header,
@@ -173,6 +197,12 @@ func (c *courier) submit(ctx context.Context, jobs []Job) ([]SubmitResult, error
 
 func (c *courier) submitBatch(ctx context.Context, jobs []Job) ([]SubmitResult, error) {
 	req := buildBulkRequest(jobs)
+
+	if c.submitTimeout > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, c.submitTimeout)
+		defer cancel()
+	}
 
 	start := time.Now()
 	resp, err := c.client.EnqueueBulk(ctx, req)
