@@ -150,15 +150,38 @@ func run(opts ...Option) int {
 		slog.String("health_port", port),
 	)
 
-	// Run the driver with the submit callback. This blocks until
-	// the context is cancelled or the driver returns an error.
-	err := c.driver.Run(ctx, c.submit)
+	return c.run(ctx, server)
+}
 
-	// Graceful shutdown.
-	cancel()
+// run runs the driver and, once it returns or ctx is cancelled, shuts down
+// within shutdownTimeout, returning the process exit code.
+func (c *courier) run(ctx context.Context, server *http.Server) int {
+	driverDone := make(chan error, 1)
+	go func() {
+		driverDone <- c.driver.Run(ctx, c.submit)
+	}()
+
+	var err error
+	driverExited := false
+	select {
+	case err = <-driverDone:
+		driverExited = true
+	case <-ctx.Done():
+	}
 
 	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), c.shutdownTimeout)
 	defer shutdownCancel()
+
+	if !driverExited {
+		var abandoned bool
+		abandoned, err = drainDriver(shutdownCtx, driverDone)
+		if abandoned {
+			// Driver did not exit in time; exit now and let process teardown close the server.
+			c.logger.Warn("driver did not exit within shutdown timeout, abandoning",
+				slog.Duration("timeout", c.shutdownTimeout))
+			return 1
+		}
+	}
 
 	if shutdownErr := server.Shutdown(shutdownCtx); shutdownErr != nil {
 		c.logger.Error("health server shutdown error", slog.String("error", shutdownErr.Error()))
@@ -171,6 +194,17 @@ func run(opts ...Option) int {
 
 	c.logger.Info("courier stopped")
 	return 0
+}
+
+// drainDriver waits for the driver to return before ctx is done,
+// reporting abandoned=true if the budget expires first.
+func drainDriver(ctx context.Context, done <-chan error) (abandoned bool, err error) {
+	select {
+	case err := <-done:
+		return false, err
+	case <-ctx.Done():
+		return true, nil
+	}
 }
 
 func parsePositiveDuration(name, value string) (time.Duration, error) {
