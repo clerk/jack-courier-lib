@@ -58,6 +58,12 @@ type SubmitResult struct {
 	// Err is non-empty. Values: "validation_error", "payload_too_large",
 	// "internal_error".
 	Reason string
+
+	// ErrorMessages holds non-fatal warnings from jack-service (e.g. an
+	// unregistered producer or job type).
+	// It is ONLY diagnostic and NOT a failure signal.
+	// A job is failed only when Err is non-empty.
+	ErrorMessages []string
 }
 
 // SubmitFunc delivers a batch of jobs to jack-service and returns per-job results.

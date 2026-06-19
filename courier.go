@@ -262,6 +262,22 @@ func (c *courier) submitBatch(ctx context.Context, jobs []Job) ([]SubmitResult, 
 		_ = c.statsd.Count("jack.courier.submit.jobs", int64(failCount), []string{"status:error"}, 1)
 	}
 
+	for i, r := range results {
+		if len(r.ErrorMessages) == 0 {
+			continue
+		}
+		var tags []string
+		if i < len(jobs) {
+			tags = []string{"job_type:" + jobs[i].JobType}
+		}
+		_ = c.statsd.Incr("jack.courier.warnings.count", tags, 1)
+		c.logger.Warn("jack accepted job with warnings",
+			slog.String("correlation_id", r.CorrelationID),
+			slog.String("job_id", r.JobID),
+			slog.Any("warnings", r.ErrorMessages),
+		)
+	}
+
 	return results, nil
 }
 
@@ -300,6 +316,7 @@ func collectResults(resp *jackpb.EnqueueBulkResponse) []SubmitResult {
 			JobID:         r.JobId,
 			Err:           r.Error,
 			Reason:        r.Reason,
+			ErrorMessages: r.ErrorMessages,
 		}
 	}
 	return results
