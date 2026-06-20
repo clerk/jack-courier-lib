@@ -1,0 +1,26 @@
+name: Slack reminders for Team Platform PRs pending review
+
+on:
+  pull_request:
+    types: [labeled, reopened, ready_for_review]
+  schedule:
+    - cron: '*/30 * * * 1-5'
+  workflow_dispatch:
+
+concurrency:
+  group: slack-pr-review-team-platform-${{ github.event_name }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  pull-requests: read
+
+jobs:
+  slack-pr-review-reminders-team-platform:
+    name: Slack PR review reminders (Team Platform)
+    uses: clerk/github-actions/.github/workflows/slack-pr-review-reminders.yml@main
+    with:
+      event-name: ${{ github.event_name }}
+      review-label: needs-platform-review
+    secrets:
+      slack_webhook_url: ${{ secrets.SLACK_PR_REVIEW_WEBHOOK_URL_TEAM_PLATFORM }}
