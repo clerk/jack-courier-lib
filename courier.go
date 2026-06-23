@@ -19,24 +19,37 @@ import (
 	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/protobuf/types/known/timestamppb"
+	grpctrace "gopkg.in/DataDog/dd-trace-go.v1/contrib/google.golang.org/grpc"
 )
 
 const (
 	defaultShutdownTimeout = 10 * time.Second
 	defaultSubmitTimeout   = 30 * time.Second
 	defaultHealthPort      = "8080"
+	// defaultMaxCallMsgBytes matches gRPC's own default (4 MiB) for both
+	// send and receive. Drivers shipping unusually large batches should raise
+	// this via WithMaxCallSendMsgSize.
+	defaultMaxCallMsgBytes = 4 * 1024 * 1024
+	// defaultTraceServiceName is the DD APM service tag applied to client
+	// spans when WithTraceServiceName is not used. Callers SHOULD override
+	// this with their own service identifier so client spans group cleanly
+	// alongside the courier's other telemetry (e.g. statsd `service:` tag).
+	defaultTraceServiceName = "background-jobs-courier"
 )
 
 type courier struct {
 	driver  Driver
 	address string
 
-	shutdownTimeout time.Duration
-	submitTimeout   time.Duration
-	logger          *slog.Logger
-	tlsOverride     *bool
-	grpcDialOpts    []grpc.DialOption
-	statsd          statsd.ClientInterface
+	shutdownTimeout     time.Duration
+	submitTimeout       time.Duration
+	logger              *slog.Logger
+	tlsOverride         *bool
+	grpcDialOpts        []grpc.DialOption
+	maxCallSendMsgBytes int
+	maxCallRecvMsgBytes int
+	traceServiceName    string
+	statsd              statsd.ClientInterface
 
 	conn   *grpc.ClientConn
 	client jackpb.BackgroundJobsClient
@@ -74,11 +87,12 @@ func run(opts ...Option) int {
 	}
 
 	c := &courier{
-		driver:          driver,
-		address:         addr,
-		shutdownTimeout: defaultShutdownTimeout,
-		submitTimeout:   defaultSubmitTimeout,
-		logger:          slog.New(slog.NewJSONHandler(os.Stdout, nil)),
+		driver:           driver,
+		address:          addr,
+		shutdownTimeout:  defaultShutdownTimeout,
+		submitTimeout:    defaultSubmitTimeout,
+		traceServiceName: defaultTraceServiceName,
+		logger:           slog.New(slog.NewJSONHandler(os.Stdout, nil)),
 	}
 
 	for _, opt := range opts {
@@ -333,7 +347,30 @@ func (c *courier) connect() error {
 		transportCreds = grpc.WithTransportCredentials(insecure.NewCredentials())
 	}
 
-	dialOpts := append([]grpc.DialOption{transportCreds}, c.grpcDialOpts...)
+	// Per-call gRPC message size limits. Default to 4 MiB (gRPC's own default)
+	// when not configured; expose as options so drivers shipping unusually
+	// large payload batches can raise the ceiling. EnqueueBulk responses are
+	// small relative to requests, so the receive limit rarely matters in
+	// practice — exposed for symmetry.
+	defaultCallOpts := []grpc.CallOption{
+		grpc.MaxCallSendMsgSize(c.effectiveMaxCallSendMsgBytes()),
+		grpc.MaxCallRecvMsgSize(c.effectiveMaxCallRecvMsgBytes()),
+	}
+
+	// gRPC client-side tracing via dd-trace-go. Emits trace.grpc.client.*
+	// (hits, errors, duration) tagged by service, resource_name, grpc.code —
+	// the foundation for client-side observability of throttling, bulkhead
+	// rejections, and tail latencies. Service name is the courier's own
+	// service identifier so client spans group cleanly under the same DD APM
+	// service as the courier's other telemetry.
+	tracingOpts := grpc.WithUnaryInterceptor(
+		grpctrace.UnaryClientInterceptor(grpctrace.WithServiceName(c.traceServiceName)),
+	)
+
+	dialOpts := append(
+		[]grpc.DialOption{transportCreds, grpc.WithDefaultCallOptions(defaultCallOpts...), tracingOpts},
+		c.grpcDialOpts...,
+	)
 
 	conn, err := grpc.NewClient(c.address, dialOpts...)
 	if err != nil {
@@ -343,6 +380,22 @@ func (c *courier) connect() error {
 	c.conn = conn
 	c.client = jackpb.NewBackgroundJobsClient(conn)
 	return nil
+}
+
+// effectiveMaxCallSendMsgBytes returns the configured limit or gRPC's default.
+func (c *courier) effectiveMaxCallSendMsgBytes() int {
+	if c.maxCallSendMsgBytes > 0 {
+		return c.maxCallSendMsgBytes
+	}
+	return defaultMaxCallMsgBytes
+}
+
+// effectiveMaxCallRecvMsgBytes returns the configured limit or gRPC's default.
+func (c *courier) effectiveMaxCallRecvMsgBytes() int {
+	if c.maxCallRecvMsgBytes > 0 {
+		return c.maxCallRecvMsgBytes
+	}
+	return defaultMaxCallMsgBytes
 }
 
 func (c *courier) shouldUseTLS() bool {

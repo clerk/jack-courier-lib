@@ -76,3 +76,47 @@ func WithSubmitTimeout(d time.Duration) Option {
 		return nil
 	}
 }
+
+// WithMaxCallSendMsgSize sets the maximum serialized size in bytes of an
+// outgoing EnqueueBulk request. A batch whose marshaled size exceeds this
+// limit fails the entire RPC with ResourceExhausted — the driver must size
+// batches in bytes, not just row count, when this matters. Defaults to
+// 4 MiB (gRPC's own default).
+func WithMaxCallSendMsgSize(bytes int) Option {
+	return func(c *courier) error {
+		if bytes <= 0 {
+			return fmt.Errorf("courier: max call send message size must be > 0, got %d", bytes)
+		}
+		c.maxCallSendMsgBytes = bytes
+		return nil
+	}
+}
+
+// WithMaxCallRecvMsgSize sets the maximum serialized size in bytes of an
+// incoming response from jack-service. EnqueueBulk responses are small
+// relative to requests, so this rarely needs raising; exposed for symmetry.
+// Defaults to 4 MiB (gRPC's own default).
+func WithMaxCallRecvMsgSize(bytes int) Option {
+	return func(c *courier) error {
+		if bytes <= 0 {
+			return fmt.Errorf("courier: max call recv message size must be > 0, got %d", bytes)
+		}
+		c.maxCallRecvMsgBytes = bytes
+		return nil
+	}
+}
+
+// WithTraceServiceName sets the DataDog APM service tag applied to client
+// gRPC spans. Callers SHOULD set this to their service identifier (e.g.
+// "background-jobs-courier-core") so client spans group cleanly under the
+// same DD APM service as the rest of their telemetry. Defaults to
+// "background-jobs-courier".
+func WithTraceServiceName(name string) Option {
+	return func(c *courier) error {
+		if name == "" {
+			return fmt.Errorf("courier: trace service name must not be empty")
+		}
+		c.traceServiceName = name
+		return nil
+	}
+}
