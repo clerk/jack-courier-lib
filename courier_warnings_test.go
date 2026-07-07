@@ -5,7 +5,7 @@ import (
 	"testing"
 
 	"github.com/DataDog/datadog-go/v5/statsd"
-	"github.com/clerk/jack-service/proto/jackpb"
+	"github.com/clerk/jack/proto/jackpb"
 )
 
 type incrCall struct {

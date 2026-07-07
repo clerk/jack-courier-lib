@@ -17,11 +17,11 @@ clean:
 lint:
 	golangci-lint run ./...
 
-# Use local jack-service proto instead of AR (for local development)
+# Use local jack proto instead of AR (for local development)
 dev:
-	@VERSION=$$(grep 'jack-service/proto/jackpb' go.mod | head -1 | awk '{print $$2}') && \
-	printf 'go 1.25.6\n\nuse .\n\nreplace github.com/clerk/jack-service/proto/jackpb %s => ../jack-service/proto/jackpb\n' "$$VERSION" > go.work
-	@echo "Local dev mode enabled (go.work created). Using ../jack-service/proto/jackpb"
+	@VERSION=$$(grep 'jack/proto/jackpb' go.mod | head -1 | awk '{print $$2}') && \
+	printf 'go 1.25.6\n\nuse .\n\nreplace github.com/clerk/jack/proto/jackpb %s => ../jack/proto/jackpb\n' "$$VERSION" > go.work
+	@echo "Local dev mode enabled (go.work created). Using ../jack/proto/jackpb"
 
 # Switch back to AR (remove local override)
 dev-clean:
