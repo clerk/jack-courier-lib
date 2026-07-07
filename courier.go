@@ -14,7 +14,7 @@ import (
 	"time"
 
 	"github.com/DataDog/datadog-go/v5/statsd"
-	"github.com/clerk/jack-service/proto/jackpb"
+	"github.com/clerk/jack/proto/jackpb"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/credentials/insecure"
