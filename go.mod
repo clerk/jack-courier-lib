@@ -4,7 +4,7 @@ go 1.25.0
 
 require (
 	github.com/DataDog/datadog-go/v5 v5.8.3
-	github.com/clerk/jack-service/proto/jackpb v0.3.0
+	github.com/clerk/jack-service/proto/jackpb v0.4.0
 	google.golang.org/grpc v1.64.1
 	google.golang.org/protobuf v1.36.5
 )
