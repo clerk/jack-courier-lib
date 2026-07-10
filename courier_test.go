@@ -176,6 +176,24 @@ func TestBuildBulkRequestThreadsID(t *testing.T) {
 	}
 }
 
+func TestBuildBulkRequestThreadsIdempotencyKey(t *testing.T) {
+	jobs := []Job{
+		{ProducerID: "p", JobType: "t1", IdempotencyKey: "psjob_alpha"},
+		{ProducerID: "p", JobType: "t2", IdempotencyKey: ""},
+		{ProducerID: "p", JobType: "t3", IdempotencyKey: "psjob_gamma"},
+	}
+
+	req := buildBulkRequest(jobs)
+	got := []string{req.Jobs[0].IdempotencyKey, req.Jobs[1].IdempotencyKey, req.Jobs[2].IdempotencyKey}
+	want := []string{"psjob_alpha", "", "psjob_gamma"}
+
+	for i := range got {
+		if got[i] != want[i] {
+			t.Errorf("Jobs[%d].IdempotencyKey = %q, want %q", i, got[i], want[i])
+		}
+	}
+}
+
 func TestCollectResults_FullSuccess(t *testing.T) {
 	resp := &jackpb.EnqueueBulkResponse{
 		Results: []*jackpb.BulkResult{

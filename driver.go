@@ -41,6 +41,14 @@ type Job struct {
 	// ships them through to jack-service in EnqueueRequest.InternalJackMeta
 	// unchanged. Empty means no jack-service control fields are set.
 	InternalJackMeta []byte
+
+	// IdempotencyKey is an optional caller-supplied key for jack-service's
+	// enqueue-side deduplication. When non-empty and jack runs with
+	// idempotency enforcement on, retrying a byte-identical request with the
+	// same key replays the originally accepted job instead of enqueueing a
+	// duplicate. Empty means the job does not opt in. Keys are scoped per
+	// ProducerID.
+	IdempotencyKey string
 }
 
 // SubmitResult represents the outcome of submitting a single job to jack-service.
