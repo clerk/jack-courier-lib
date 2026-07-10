@@ -10,12 +10,23 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
+env:
+  GO_MODULES_TOKEN: ${{ secrets.GO_MODULES_TOKEN }}
+
 jobs:
   vet:
     name: Vet
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - name: Configure private Go modules
+        run: |
+          if [ -n "${GO_MODULES_TOKEN:-}" ]; then
+            git config --global url."https://x-access-token:${GO_MODULES_TOKEN}@github.com/clerk/".insteadOf "https://github.com/clerk/"
+            echo "GOPRIVATE=github.com/clerk/*" >> "$GITHUB_ENV"
+          else
+            echo "::warning::GO_MODULES_TOKEN is unset; skipping private Go module configuration. Private clerk modules may fail to resolve."
+          fi
       - uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
@@ -26,6 +37,14 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - name: Configure private Go modules
+        run: |
+          if [ -n "${GO_MODULES_TOKEN:-}" ]; then
+            git config --global url."https://x-access-token:${GO_MODULES_TOKEN}@github.com/clerk/".insteadOf "https://github.com/clerk/"
+            echo "GOPRIVATE=github.com/clerk/*" >> "$GITHUB_ENV"
+          else
+            echo "::warning::GO_MODULES_TOKEN is unset; skipping private Go module configuration. Private clerk modules may fail to resolve."
+          fi
       - uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
@@ -38,6 +57,14 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - name: Configure private Go modules
+        run: |
+          if [ -n "${GO_MODULES_TOKEN:-}" ]; then
+            git config --global url."https://x-access-token:${GO_MODULES_TOKEN}@github.com/clerk/".insteadOf "https://github.com/clerk/"
+            echo "GOPRIVATE=github.com/clerk/*" >> "$GITHUB_ENV"
+          else
+            echo "::warning::GO_MODULES_TOKEN is unset; skipping private Go module configuration. Private clerk modules may fail to resolve."
+          fi
       - uses: actions/setup-go@v5
         with:
           go-version-file: go.mod

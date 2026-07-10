@@ -293,6 +293,7 @@ func buildBulkRequest(jobs []Job) *jackpb.EnqueueBulkRequest {
 			CorrelationId:    j.CorrelationID,
 			JobId:            j.ID,
 			InternalJackMeta: j.InternalJackMeta,
+			IdempotencyKey:   j.IdempotencyKey,
 		}
 		if !j.RunAt.IsZero() {
 			req.RunAt = timestamppb.New(j.RunAt)
