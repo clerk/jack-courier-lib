@@ -6,27 +6,32 @@ import (
 	"time"
 )
 
-// Job represents a single background job to be delivered to jack-service.
+// Job represents a single background job to be published to Pub/Sub.
 type Job struct {
 	// CorrelationID is a driver-assigned reference that is echoed back in
 	// SubmitResult. The driver uses this to track which jobs were successfully
-	// enqueued (e.g., outbox row primary key, WAL LSN).
+	// published (e.g., outbox row primary key, WAL LSN).
 	CorrelationID string
 
-	// ID is an optional caller-supplied job ID. When non-empty, jack-service
-	// uses it as the canonical job identifier instead of generating one
-	// server-side. Drivers (e.g., jack-courier-driver-pglg) populate this
-	// from the producer's payload so the producer-side ID is preserved
-	// end-to-end through the pipeline.
+	// ID is the producer-side job identifier, extracted from the producer's
+	// payload. It is attached to the published message as the `job_id`
+	// attribute; consumers use it for deduplication.
 	ID string
 
-	// ProducerID identifies the producer in jack-service.
+	// Queue selects the Pub/Sub topic this job is published to. Drivers
+	// populate it from the outbox row's queue column; the courier maps it
+	// to a topic via its configured queue:topic map.
+	Queue string
+
+	// ProducerID identifies the producing service.
 	ProducerID string
 
-	// JobType is the registered job type name in jack-service.
+	// JobType is the job type name.
 	JobType string
 
-	// Payload is the opaque job data delivered to consumers.
+	// Payload is the opaque job data, published verbatim as the message
+	// body. Its shape is the producer↔consumer contract; the courier does
+	// not inspect it.
 	Payload []byte
 
 	// RunAt is the scheduled execution time. Zero value means run immediately.
@@ -35,66 +40,52 @@ type Job struct {
 	// TraceID is an optional distributed tracing correlation ID.
 	TraceID string
 
-	// InternalJackMeta carries the producer-supplied jack-service control
-	// header for this job. The driver reads the bytes from the producer's
-	// outbox row (a serialized jack.InternalJackMeta proto) and the courier
-	// ships them through to jack-service in EnqueueRequest.InternalJackMeta
-	// unchanged. Empty means no jack-service control fields are set.
+	// InternalJackMeta carries the producer-supplied control header for this
+	// job (a serialized jackpb.InternalJackMeta proto read from the outbox
+	// row). The courier decodes it to derive the `shadow` message attribute.
+	// Empty means no control fields are set.
 	InternalJackMeta []byte
-
-	// IdempotencyKey is an optional caller-supplied key for jack-service's
-	// enqueue-side deduplication. When non-empty and jack runs with
-	// idempotency enforcement on, retrying a byte-identical request with the
-	// same key replays the originally accepted job instead of enqueueing a
-	// duplicate. Empty means the job does not opt in. Keys are scoped per
-	// ProducerID.
-	IdempotencyKey string
 }
 
-// SubmitResult represents the outcome of submitting a single job to jack-service.
+// SubmitResult represents the outcome of publishing a single job.
 type SubmitResult struct {
 	// CorrelationID is echoed from the submitted Job.CorrelationID.
 	CorrelationID string
 
-	// JobID is the jack-service assigned job identifier.
+	// JobID is echoed from the submitted Job.ID.
 	JobID string
 
-	// Err is non-empty if this job failed to enqueue.
+	// Err is non-empty if this job failed to publish.
 	Err string
 
-	// Reason is the rejection class from jack-service, set only when
-	// Err is non-empty. Values: "validation_error", "payload_too_large",
-	// "internal_error".
+	// Reason is the rejection class, set only for failures that can never
+	// succeed: "payload_too_large", "validation_error". Empty means the
+	// failure is retryable.
 	Reason string
-
-	// ErrorMessages holds non-fatal warnings from jack-service (e.g. an
-	// unregistered producer or job type).
-	// It is ONLY diagnostic and NOT a failure signal.
-	// A job is failed only when Err is non-empty.
-	ErrorMessages []string
 }
 
-// SubmitFunc delivers a batch of jobs to jack-service and returns per-job results.
+// SubmitFunc publishes a batch of jobs to Pub/Sub and returns per-job results.
 // Calling it with an empty jobs slice is a no-op and returns nil, nil.
 //
-// If the gRPC call itself fails, err is non-nil and results is nil. The driver
-// should probably retry or back off.
+// If the batch fails as a whole (e.g. a transport outage where every publish
+// failed retryably), err is non-nil and results is nil. The driver should
+// retry the batch with backoff.
 //
 // On partial failure, results contains a mix of successful and failed entries.
 // Each result has a `CorrelationID` echoed from the submitted job.
 type SubmitFunc func(ctx context.Context, jobs []Job) ([]SubmitResult, error)
 
-// Driver sources jobs for delivery to jack-service. The courier calls
-// Driver.Run, passing a submit callback. The driver controls when and
-// how often to call submit — it owns the dispatch loop.
+// Driver sources jobs for publishing. The courier calls Driver.Run, passing
+// a submit callback. The driver controls when and how often to call submit —
+// it owns the dispatch loop.
 //
 // When building a new driver, ensure it:
 // - Populates all required Job fields
-// - Handles gRPC errors from `submit` (e.g. retry with backoff)
+// - Handles batch errors from `submit` (e.g. retry with backoff)
 // - Handles per-job failures in `SubmitResult.Err` (retry, dead-letter, or log)
 // - Tracks delivery state so jobs are not re-submitted after success (e.g., advance WAL LSN, delete outbox rows, update cursor)
-// - Batches efficiently — larger batches reduce gRPC round-trips; smaller batches reduce latency
-// - Implements backpressure — if jack-service is slow or erroring, the driver should back off rather than flood it
+// - Batches efficiently — larger batches amortize per-call overhead; smaller batches reduce latency
+// - Implements backpressure — if publishing is slow or erroring, the driver should back off rather than flood
 type Driver interface {
 	// Run starts the driver. The driver calls submit whenever it has a batch
 	// of jobs ready for delivery. Run should exit when ctx is cancelled or an

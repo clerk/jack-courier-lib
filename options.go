@@ -6,7 +6,6 @@ import (
 	"time"
 
 	"github.com/DataDog/datadog-go/v5/statsd"
-	"google.golang.org/grpc"
 )
 
 // Option configures a courier instance.
@@ -19,23 +18,6 @@ func WithLogger(logger *slog.Logger) Option {
 			return fmt.Errorf("courier: logger must not be nil")
 		}
 		c.logger = logger
-		return nil
-	}
-}
-
-// WithTLS forces TLS on or off for the gRPC connection to jack-service.
-// By default, TLS is auto-detected: enabled when the address ends with ":443".
-func WithTLS(enabled bool) Option {
-	return func(c *courier) error {
-		c.tlsOverride = &enabled
-		return nil
-	}
-}
-
-// WithGRPCDialOptions appends additional gRPC dial options to the connection.
-func WithGRPCDialOptions(opts ...grpc.DialOption) Option {
-	return func(c *courier) error {
-		c.grpcDialOpts = append(c.grpcDialOpts, opts...)
 		return nil
 	}
 }
@@ -63,10 +45,10 @@ func WithShutdownTimeout(d time.Duration) Option {
 	}
 }
 
-// WithSubmitTimeout sets the per-call deadline applied to each EnqueueBulk
-// RPC. The driver's lifecycle context still controls overall shutdown.
-// This only affects an individual submit so a stalled jack-service cannot hang the
-// courier indefinitely. Defaults to 30 seconds.
+// WithSubmitTimeout sets the deadline applied to each submit call's publishes.
+// The driver's lifecycle context still controls overall shutdown. This only
+// affects an individual submit so a stalled Pub/Sub cannot hang the courier
+// indefinitely. Defaults to 30 seconds.
 func WithSubmitTimeout(d time.Duration) Option {
 	return func(c *courier) error {
 		if d <= 0 {
