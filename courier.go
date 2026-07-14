@@ -122,7 +122,6 @@ func run(opts ...Option) int {
 		c.logger.Error("failed to create pubsub publishers", slog.String("error", err.Error()))
 		return 1
 	}
-	defer c.stopPublishers()
 
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer cancel()
@@ -178,6 +177,10 @@ func (c *courier) run(ctx context.Context, server *http.Server) int {
 
 	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), c.shutdownTimeout)
 	defer shutdownCancel()
+
+	// The publisher flush shares the shutdown budget with the driver drain,
+	// so the shutdown timeout bounds total termination time as documented.
+	defer c.stopPublishers(shutdownCtx)
 
 	if !driverExited {
 		var abandoned bool

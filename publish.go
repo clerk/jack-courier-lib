@@ -4,14 +4,14 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"cloud.google.com/go/pubsub/v2"
 	"github.com/clerk/jack/proto/jackpb"
-	"google.golang.org/grpc/codes"
-	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/proto"
 )
 
@@ -50,7 +50,7 @@ func (c *courier) buildPublishers(ctx context.Context, topics map[string]string)
 	for queue, topic := range topics {
 		client, err := pubsub.NewClient(ctx, c.project)
 		if err != nil {
-			c.stopPublishers()
+			c.stopPublishers(ctx)
 			return fmt.Errorf("courier: create pubsub client for queue %q: %w", queue, err)
 		}
 		c.publishers[queue] = &queuePublisher{client: client, pub: client.Publisher(topic)}
@@ -58,11 +58,30 @@ func (c *courier) buildPublishers(ctx context.Context, topics map[string]string)
 	return nil
 }
 
-// stopPublishers flushes pending publishes and closes the per-queue clients.
-func (c *courier) stopPublishers() {
-	for _, qp := range c.publishers {
-		qp.pub.Stop()
-		_ = qp.client.Close()
+// stopPublishers flushes pending publishes and closes the per-queue clients,
+// abandoning the flush when ctx expires so shutdown stays within its budget.
+// Abandoning is safe: publishes that never resolved were not acked to the
+// driver, so those jobs survive in the outbox or the driver's retryable DLQ
+// and are redelivered later.
+func (c *courier) stopPublishers(ctx context.Context) {
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		var wg sync.WaitGroup
+		for _, qp := range c.publishers {
+			wg.Go(func() {
+				qp.pub.Stop()
+				if err := qp.client.Close(); err != nil {
+					c.logger.Warn("pubsub client close error", slog.String("error", err.Error()))
+				}
+			})
+		}
+		wg.Wait()
+	}()
+	select {
+	case <-done:
+	case <-ctx.Done():
+		c.logger.Warn("publisher shutdown exceeded the shutdown timeout, abandoning flush")
 	}
 }
 
@@ -190,13 +209,15 @@ func shadowFromMeta(b []byte) (bool, error) {
 }
 
 // classifyPublishError maps a publish failure to a SubmitResult.Reason.
-// Empty means retryable. Only failures that can never succeed are permanent.
+// Empty means retryable. Only ErrOversizedMessage is permanent: it is the
+// one failure proven per-message, checked client-side before sending.
+// Server statuses (including InvalidArgument) stay retryable because a
+// publish RPC carries a whole batch and stamps one error onto every message
+// in it, so a request-level problem (e.g. a malformed topic in config) would
+// otherwise permanently dead-letter valid committed jobs.
 func classifyPublishError(err error) string {
 	if errors.Is(err, pubsub.ErrOversizedMessage) {
 		return reasonPayloadTooLarge
-	}
-	if status.Code(err) == codes.InvalidArgument {
-		return reasonValidationError
 	}
 	return ""
 }

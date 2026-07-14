@@ -72,7 +72,9 @@ func TestClassifyPublishError(t *testing.T) {
 	}{
 		{"oversized message is permanent", pubsub.ErrOversizedMessage, reasonPayloadTooLarge},
 		{"wrapped oversized message is permanent", fmt.Errorf("wrap: %w", pubsub.ErrOversizedMessage), reasonPayloadTooLarge},
-		{"invalid argument is permanent", status.Error(codes.InvalidArgument, "bad attribute"), reasonValidationError},
+		// InvalidArgument is request-level (one Publish RPC carries the whole
+		// batch), so it may reflect config problems and must not dead-letter.
+		{"invalid argument is retryable", status.Error(codes.InvalidArgument, "bad topic"), ""},
 		{"unavailable is retryable", status.Error(codes.Unavailable, "down"), ""},
 		{"not found is retryable", status.Error(codes.NotFound, "no topic"), ""},
 		{"deadline is retryable", context.DeadlineExceeded, ""},
@@ -161,7 +163,7 @@ func newPubsubCourier(t *testing.T, topics map[string]string, create []string) (
 	if err := c.buildPublishers(t.Context(), topics); err != nil {
 		t.Fatalf("buildPublishers: %v", err)
 	}
-	t.Cleanup(c.stopPublishers)
+	t.Cleanup(func() { c.stopPublishers(context.Background()) })
 
 	return c, srv
 }
@@ -423,6 +425,36 @@ func TestSubmit_EmitsMetrics(t *testing.T) {
 	}
 	if got := rec.countValue("jack.courier.submit.future_jobs", "job_type:sms"); got != 1 {
 		t.Errorf("future_jobs{sms} = %d, want 1", got)
+	}
+}
+
+func TestStopPublishers_BoundedByContext(t *testing.T) {
+	// Every Publish RPC fails retryably, so the client keeps the message
+	// pending and Publisher.Stop blocks flushing it far beyond any shutdown
+	// budget. stopPublishers must give up when its context expires.
+	srv := pstest.NewServer(pstest.WithErrorInjection("Publish", codes.Unavailable, "injected outage"))
+	t.Cleanup(func() { _ = srv.Close() })
+	t.Setenv("PUBSUB_EMULATOR_HOST", srv.Addr)
+
+	client, err := pubsub.NewClient(context.Background(), "test-project")
+	if err != nil {
+		t.Fatalf("client: %v", err)
+	}
+	c := &courier{
+		logger:     discardLogger(),
+		statsd:     &statsd.NoOpClient{},
+		publishers: map[string]*queuePublisher{"high": {client: client, pub: client.Publisher("topic_high")}},
+	}
+	// The result is deliberately not awaited: the publish stays pending.
+	c.publishers["high"].pub.Publish(context.Background(), &pubsub.Message{Data: []byte("x")})
+
+	ctx, cancel := context.WithTimeout(t.Context(), 50*time.Millisecond)
+	defer cancel()
+
+	start := time.Now()
+	c.stopPublishers(ctx)
+	if elapsed := time.Since(start); elapsed > 2*time.Second {
+		t.Fatalf("stopPublishers took %v, want it bounded by its context", elapsed)
 	}
 }
 
