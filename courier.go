@@ -226,10 +226,6 @@ func (c *courier) submit(ctx context.Context, jobs []Job) ([]SubmitResult, error
 	if len(jobs) == 0 {
 		return nil, nil
 	}
-	return c.submitBatch(ctx, jobs)
-}
-
-func (c *courier) submitBatch(ctx context.Context, jobs []Job) ([]SubmitResult, error) {
 	req := buildBulkRequest(jobs)
 
 	if c.submitTimeout > 0 {
