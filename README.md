@@ -2,7 +2,7 @@
 
 A Go library that publishes background jobs to GCP Pub/Sub. It provides a pluggable **Driver** interface so that different job-sourcing strategies (Postgres polling, WAL, message queues, etc.) can be implemented independently.
 
-Each job carries a queue name; the courier publishes it to that queue's configured topic. The payload is published verbatim as the message body — its shape is the producer↔consumer contract, not the courier's concern. The message carries `job_id` and `shadow` attributes (the latter decoded from the job's control header, so workers can ack shadow jobs without executing them).
+Each job carries a queue name; the courier publishes it to that queue's configured topic. The payload is published verbatim as the message body — its shape is the producer↔consumer contract, not the courier's concern. The message carries `shadow` (decoded from the job's control header, so workers can ack shadow jobs without executing them), plus `job_id`, `trace_id` and `producer_id` attributes so consumers can dedup, trace and attribute jobs without decoding the payload. Attributes with empty values are omitted.
 
 ## Architecture
 
@@ -48,7 +48,7 @@ Required:
 
 Optional:
 
-- `JACK_COURIER_SUBMIT_TIMEOUT` — deadline applied to each submit call's publishes, parsed as a Go duration (e.g. `30s`, `1m`). Defaults to `30s`. The driver's lifecycle context still controls overall shutdown; this only bounds an individual submit so a stalled Pub/Sub cannot hang the courier.
+- `JACK_COURIER_SUBMIT_TIMEOUT` — deadline applied to each submit call's publishes, parsed as a Go duration (e.g. `30s`, `1m`). Defaults to `30s`. The driver's lifecycle context still controls overall shutdown; this only bounds an individual submit so a stalled Pub/Sub cannot hang the courier. It also caps the client's own publish attempts, so an abandoned publish stops retrying in the background.
 - `JACK_COURIER_SHUTDOWN_TIMEOUT` — graceful shutdown timeout, parsed as a Go duration. Defaults to `10s`. On `SIGINT`/`SIGTERM` this bounds total termination time. If the driver does not return within it, the driver is abandoned and the process exits anyway, so the courier never takes longer than the timeout to shut down.
 - `PUBSUB_EMULATOR_HOST` — standard Pub/Sub emulator override for local development.
 

@@ -81,6 +81,7 @@ type SubmitFunc func(ctx context.Context, jobs []Job) ([]SubmitResult, error)
 //
 // When building a new driver, ensure it:
 // - Populates all required Job fields
+// - Batches per queue where possible: call-level metrics take the first job's queue (per-job metrics attribute by each job's own queue)
 // - Handles batch errors from `submit` (e.g. retry with backoff)
 // - Handles per-job failures in `SubmitResult.Err` (retry, dead-letter, or log)
 // - Tracks delivery state so jobs are not re-submitted after success (e.g., advance WAL LSN, delete outbox rows, update cursor)

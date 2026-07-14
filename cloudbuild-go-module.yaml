@@ -22,7 +22,7 @@ steps:
           --project=${PROJECT_ID} \
           --repository=${_GO_REPOSITORY} \
           --location=${_REGION} \
-          --module-path=github.com/clerk/jack-courier-lib \
+          --module-path=github.com/clerk/jack-courier-lib/v2 \
           --version=${TAG_NAME} \
           --source=.
 

@@ -2,6 +2,7 @@ package courier
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 	"sync"
@@ -32,6 +33,13 @@ func TestParseTopicMap(t *testing.T) {
 			map[string]string{"high": "clerk_jobs_high", "session-minter": "clerk_jobs_session_minter"},
 			false,
 		},
+		{
+			"spaces around colon are trimmed",
+			"high: clerk_jobs_high,low : clerk_jobs_low",
+			map[string]string{"high": "clerk_jobs_high", "low": "clerk_jobs_low"},
+			false,
+		},
+		{"whitespace-only topic", "high: ", nil, true},
 		{"missing colon", "high", nil, true},
 		{"empty queue", ":topic", nil, true},
 		{"empty topic", "high:", nil, true},
@@ -233,6 +241,8 @@ func TestSubmit_PassthroughPayloadAndAttributes(t *testing.T) {
 		CorrelationID:    "42",
 		ID:               "psjob_123",
 		Queue:            "high",
+		ProducerID:       "clerk_go",
+		TraceID:          "trace_abc",
 		Payload:          payload,
 		InternalJackMeta: metaBytes(t, true),
 	}}
@@ -248,7 +258,12 @@ func TestSubmit_PassthroughPayloadAndAttributes(t *testing.T) {
 	if string(msgs[0].Data) != string(payload) {
 		t.Errorf("Data = %q, want payload verbatim %q", msgs[0].Data, payload)
 	}
-	want := map[string]string{"shadow": "true", "job_id": "psjob_123"}
+	want := map[string]string{
+		"shadow":      "true",
+		"job_id":      "psjob_123",
+		"trace_id":    "trace_abc",
+		"producer_id": "clerk_go",
+	}
 	if len(msgs[0].Attributes) != len(want) {
 		t.Errorf("Attributes = %v, want exactly %v", msgs[0].Attributes, want)
 	}
@@ -256,6 +271,30 @@ func TestSubmit_PassthroughPayloadAndAttributes(t *testing.T) {
 		if msgs[0].Attributes[k] != v {
 			t.Errorf("Attributes[%q] = %q, want %q", k, msgs[0].Attributes[k], v)
 		}
+	}
+}
+
+func TestSubmit_OmitsEmptyAttributes(t *testing.T) {
+	// A present-but-empty job_id would collide distinct jobs on the same
+	// dedup key; empty attributes must be omitted, not published.
+	c, srv := newPubsubCourier(t,
+		map[string]string{"high": "topic_high"},
+		[]string{"topic_high"},
+	)
+
+	jobs := []Job{{CorrelationID: "1", Queue: "high", Payload: []byte("x")}}
+
+	if _, err := c.submit(t.Context(), jobs); err != nil {
+		t.Fatalf("submit: %v", err)
+	}
+
+	msgs := srv.Messages()
+	if len(msgs) != 1 {
+		t.Fatalf("expected 1 message, got %d", len(msgs))
+	}
+	want := map[string]string{"shadow": "false"}
+	if len(msgs[0].Attributes) != len(want) || msgs[0].Attributes["shadow"] != "false" {
+		t.Errorf("Attributes = %v, want exactly %v", msgs[0].Attributes, want)
 	}
 }
 
@@ -428,10 +467,11 @@ func TestSubmit_EmitsMetrics(t *testing.T) {
 	}
 }
 
-func TestStopPublishers_BoundedByContext(t *testing.T) {
-	// Every Publish RPC fails retryably, so the client keeps the message
-	// pending and Publisher.Stop blocks flushing it far beyond any shutdown
-	// budget. stopPublishers must give up when its context expires.
+// newStalledCourier builds a courier whose Publish RPCs always fail with a
+// retryable code, so publishes stay pending in the client indefinitely.
+func newStalledCourier(t *testing.T) *courier {
+	t.Helper()
+
 	srv := pstest.NewServer(pstest.WithErrorInjection("Publish", codes.Unavailable, "injected outage"))
 	t.Cleanup(func() { _ = srv.Close() })
 	t.Setenv("PUBSUB_EMULATOR_HOST", srv.Addr)
@@ -445,6 +485,20 @@ func TestStopPublishers_BoundedByContext(t *testing.T) {
 		statsd:     &statsd.NoOpClient{},
 		publishers: map[string]*queuePublisher{"high": {client: client, pub: client.Publisher("topic_high")}},
 	}
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+		defer cancel()
+		c.stopPublishers(ctx)
+	})
+	return c
+}
+
+func TestStopPublishers_BoundedByContext(t *testing.T) {
+	// A pending publish makes Publisher.Stop block on flushing it far beyond
+	// any shutdown budget. stopPublishers must give up when its context
+	// expires.
+	c := newStalledCourier(t)
+
 	// The result is deliberately not awaited: the publish stays pending.
 	c.publishers["high"].pub.Publish(context.Background(), &pubsub.Message{Data: []byte("x")})
 
@@ -455,6 +509,126 @@ func TestStopPublishers_BoundedByContext(t *testing.T) {
 	c.stopPublishers(ctx)
 	if elapsed := time.Since(start); elapsed > 2*time.Second {
 		t.Fatalf("stopPublishers took %v, want it bounded by its context", elapsed)
+	}
+}
+
+func TestSubmit_TimesOutOnStalledPublish(t *testing.T) {
+	// A stalled Pub/Sub must not hang submit past the configured submit
+	// timeout: every publish fails with the context error and the batch
+	// surfaces as a retryable batch error to the driver.
+	c := newStalledCourier(t)
+	c.submitTimeout = 100 * time.Millisecond
+
+	start := time.Now()
+	results, err := c.submit(context.Background(), []Job{
+		{CorrelationID: "1", ID: "a", Queue: "high", Payload: []byte("x")},
+	})
+	if err == nil {
+		t.Fatalf("expected batch error from stalled publishes, got results %v", results)
+	}
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Errorf("err = %v, want it to wrap context.DeadlineExceeded", err)
+	}
+	if elapsed := time.Since(start); elapsed > 2*time.Second {
+		t.Fatalf("submit took %v, want it bounded by the submit timeout", elapsed)
+	}
+}
+
+func TestSubmit_RejectsDeadContext(t *testing.T) {
+	// The client publishes bundles on a background context, so a dead caller
+	// context must fail the batch before anything is enqueued, and the error
+	// must keep its identity so shutdown is not mistaken for a failure.
+	c, srv := newPubsubCourier(t,
+		map[string]string{"high": "topic_high"},
+		[]string{"topic_high"},
+	)
+
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+
+	_, err := c.submit(ctx, []Job{{CorrelationID: "1", ID: "a", Queue: "high", Payload: []byte("x")}})
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("err = %v, want it to wrap context.Canceled", err)
+	}
+	if n := len(srv.Messages()); n != 0 {
+		t.Errorf("expected nothing published, got %d messages", n)
+	}
+}
+
+func TestSubmit_MixedQueueBatchAttributesJobMetricsPerQueue(t *testing.T) {
+	// The DLQ retry path can submit one batch spanning queues; per-job
+	// metrics must attribute failures to the failing job's queue.
+	c, _ := newPubsubCourier(t,
+		map[string]string{"high": "topic_high", "low": "topic_low"},
+		[]string{"topic_high", "topic_low"},
+	)
+	rec := &recordingStatsd{ClientInterface: &statsd.NoOpClient{}}
+	c.statsd = rec
+
+	jobs := []Job{
+		{CorrelationID: "1", ID: "a", Queue: "high", Payload: []byte("x")},
+		{CorrelationID: "2", ID: "b", Queue: "low", Payload: []byte("y"), InternalJackMeta: []byte{0xff, 0xff, 0xff, 0xff}},
+	}
+
+	if _, err := c.submit(t.Context(), jobs); err != nil {
+		t.Fatalf("submit: %v", err)
+	}
+
+	if got := rec.countValue("jack.courier.submit.jobs", "status:success", "queue:high"); got != 1 {
+		t.Errorf("success{high} = %d, want 1", got)
+	}
+	if got := rec.countValue("jack.courier.submit.jobs", "status:error", "queue:low"); got != 1 {
+		t.Errorf("error{low} = %d, want 1", got)
+	}
+	if got := rec.countValue("jack.courier.submit.jobs", "status:error", "queue:high"); got != 0 {
+		t.Errorf("error{high} = %d, want 0", got)
+	}
+}
+
+func TestBuildPublishers_AppliesSubmitTimeout(t *testing.T) {
+	// PublishSettings.Timeout must follow the submit deadline, or an
+	// abandoned publish keeps retrying in the background for the client's
+	// 60s default and can land after the driver already retried the batch.
+	srv := pstest.NewServer()
+	t.Cleanup(func() { _ = srv.Close() })
+	t.Setenv("PUBSUB_EMULATOR_HOST", srv.Addr)
+
+	c := &courier{
+		project:       "test-project",
+		logger:        discardLogger(),
+		statsd:        &statsd.NoOpClient{},
+		submitTimeout: 5 * time.Second,
+	}
+	if err := c.buildPublishers(t.Context(), map[string]string{"high": "topic_high"}); err != nil {
+		t.Fatalf("buildPublishers: %v", err)
+	}
+	t.Cleanup(func() { c.stopPublishers(context.Background()) })
+
+	if got := c.publishers["high"].pub.PublishSettings.Timeout; got != 5*time.Second {
+		t.Errorf("PublishSettings.Timeout = %v, want 5s", got)
+	}
+}
+
+func TestSubmit_FutureJobsMetricSkipsFailures(t *testing.T) {
+	c, _ := newPubsubCourier(t,
+		map[string]string{"high": "topic_high"},
+		[]string{"topic_high"},
+	)
+	rec := &recordingStatsd{ClientInterface: &statsd.NoOpClient{}}
+	c.statsd = rec
+
+	future := time.Now().Add(time.Hour)
+	jobs := []Job{
+		{CorrelationID: "1", ID: "a", Queue: "high", JobType: "email", Payload: []byte("x"), RunAt: future},
+		{CorrelationID: "2", ID: "b", Queue: "high", JobType: "email", Payload: []byte("y"), RunAt: future, InternalJackMeta: []byte{0xff, 0xff, 0xff, 0xff}},
+	}
+
+	if _, err := c.submit(t.Context(), jobs); err != nil {
+		t.Fatalf("submit: %v", err)
+	}
+
+	if got := rec.countValue("jack.courier.submit.future_jobs", "job_type:email"); got != 1 {
+		t.Errorf("future_jobs{email} = %d, want 1 (the failed job must not count)", got)
 	}
 }
 
@@ -504,12 +678,23 @@ func (r *recordingStatsd) incrTags(name string) []string {
 	return nil
 }
 
-func (r *recordingStatsd) countValue(name, tag string) int64 {
+// countValue sums the values of every Count call carrying all given tags.
+func (r *recordingStatsd) countValue(name string, tags ...string) int64 {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	var total int64
 	for _, c := range r.calls {
-		if c.name == name && hasTag(c.tags, tag) {
+		if c.name != name {
+			continue
+		}
+		matched := true
+		for _, tag := range tags {
+			if !hasTag(c.tags, tag) {
+				matched = false
+				break
+			}
+		}
+		if matched {
 			total += int64(c.value)
 		}
 	}
