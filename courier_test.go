@@ -416,6 +416,43 @@ func TestSubmit_TimesOutOnSlowJack(t *testing.T) {
 	}
 }
 
+func TestSubmit_SinkNoop(t *testing.T) {
+	srv := &mockBackgroundJobsServer{
+		enqueueBulkFn: func(context.Context, *jackpb.EnqueueBulkRequest) (*jackpb.EnqueueBulkResponse, error) {
+			t.Error("EnqueueBulk must not be called when sinkNoop is set")
+			return &jackpb.EnqueueBulkResponse{}, nil
+		},
+	}
+
+	conn := startMockServer(t, srv)
+	c := &courier{
+		client:   jackpb.NewBackgroundJobsClient(conn),
+		logger:   discardLogger(),
+		statsd:   &statsd.NoOpClient{},
+		sinkNoop: true,
+	}
+
+	jobs := []Job{
+		{CorrelationID: "c1", ID: "psjob_abc", ProducerID: "prod_1", JobType: "email"},
+		{CorrelationID: "c2", ProducerID: "prod_1", JobType: "sms"},
+	}
+
+	results, err := c.submit(context.Background(), jobs)
+	if err != nil {
+		t.Fatalf("submit returned error: %v", err)
+	}
+
+	if len(results) != 2 {
+		t.Fatalf("expected 2 results, got %d", len(results))
+	}
+	if results[0].CorrelationID != "c1" || results[0].JobID != "psjob_abc" || results[0].Err != "" {
+		t.Errorf("unexpected result[0]: %+v", results[0])
+	}
+	if results[1].CorrelationID != "c2" || results[1].JobID != "" || results[1].Err != "" {
+		t.Errorf("unexpected result[1]: %+v", results[1])
+	}
+}
+
 func TestParsePositiveDuration(t *testing.T) {
 	tests := []struct {
 		name    string
@@ -627,6 +664,41 @@ func TestRun_SignalDriverAbandonedOnTimeout(t *testing.T) {
 	}
 }
 
+// TestRun_SinkNoopEndToEnd exercises the full run() path with
+// JACK_COURIER_SINK_NOOP: JACK_SERVICE_ADDR is not required, no gRPC
+// connection is made, and the driver's submits are acknowledged successfully.
+func TestRun_SinkNoopEndToEnd(t *testing.T) {
+	t.Setenv("JACK_COURIER_SINK_NOOP", "true")
+	t.Setenv("JACK_SERVICE_ADDR", "")
+	t.Setenv("PORT", "0")
+
+	var got []SubmitResult
+	var submitErr error
+	swapDriver(t, fakeDriver{run: func(ctx context.Context, submit SubmitFunc) error {
+		got, submitErr = submit(ctx, []Job{{CorrelationID: "c1", ID: "psjob_abc", ProducerID: "p", JobType: "email"}})
+		return nil
+	}})
+
+	if code := run(WithLogger(discardLogger())); code != 0 {
+		t.Fatalf("expected exit code 0, got %d", code)
+	}
+	if submitErr != nil {
+		t.Fatalf("submit returned error: %v", submitErr)
+	}
+	if len(got) != 1 || got[0].CorrelationID != "c1" || got[0].JobID != "psjob_abc" || got[0].Err != "" {
+		t.Fatalf("unexpected results: %+v", got)
+	}
+}
+
+func TestRun_InvalidSinkNoop(t *testing.T) {
+	t.Setenv("JACK_COURIER_SINK_NOOP", "banana")
+	swapDriver(t, &noopDriver{})
+
+	if code := run(WithLogger(discardLogger())); code != 1 {
+		t.Fatalf("expected exit code 1 for invalid JACK_COURIER_SINK_NOOP, got %d", code)
+	}
+}
+
 func TestDrainDriver_ReturnsWithinBudget(t *testing.T) {
 	driverErr := errors.New("driver stopped")
 	done := make(chan error, 1)
@@ -673,6 +745,23 @@ func (d fakeDriver) Run(ctx context.Context, submit SubmitFunc) error {
 
 func discardLogger() *slog.Logger {
 	return slog.New(slog.NewTextHandler(io.Discard, nil))
+}
+
+// swapDriver registers d for the duration of the test, restoring the
+// previous global registration afterwards.
+func swapDriver(t *testing.T, d Driver) {
+	t.Helper()
+
+	driverMu.Lock()
+	origDriver, origRegistered := registeredDriver, driverRegistered
+	registeredDriver, driverRegistered = d, true
+	driverMu.Unlock()
+
+	t.Cleanup(func() {
+		driverMu.Lock()
+		registeredDriver, driverRegistered = origDriver, origRegistered
+		driverMu.Unlock()
+	})
 }
 
 type noopDriver struct{}
