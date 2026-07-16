@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -33,6 +34,7 @@ type courier struct {
 
 	shutdownTimeout time.Duration
 	submitTimeout   time.Duration
+	sinkNoop        bool
 	logger          *slog.Logger
 	tlsOverride     *bool
 	grpcDialOpts    []grpc.DialOption
@@ -50,12 +52,16 @@ type courier struct {
 // a graceful shutdown.
 //
 // Required environment variables:
-//   - JACK_SERVICE_ADDR: jack-service gRPC address (e.g., "jack-service:50051")
+//   - JACK_SERVICE_ADDR: jack-service gRPC address (e.g., "jack-service:50051").
+//     Not required when JACK_COURIER_SINK_NOOP is enabled.
 //
 // Optional environment variables:
 //   - PORT: health check HTTP server port (default "8080")
 //   - JACK_COURIER_SHUTDOWN_TIMEOUT: graceful shutdown timeout (default "10s")
 //   - JACK_COURIER_SUBMIT_TIMEOUT: per-call EnqueueBulk timeout (default "30s")
+//   - JACK_COURIER_SINK_NOOP: if "true" or "1", never call jack-service;
+//     submitted jobs are acknowledged as accepted and dropped. Used to
+//     validate drivers in production before the real sink is in place.
 func Main(opts ...Option) {
 	os.Exit(run(opts...))
 }
@@ -67,8 +73,18 @@ func run(opts ...Option) int {
 		return 1
 	}
 
+	sinkNoop := false
+	if v := os.Getenv("JACK_COURIER_SINK_NOOP"); v != "" {
+		b, err := strconv.ParseBool(v)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "courier: invalid JACK_COURIER_SINK_NOOP: %v\n", err)
+			return 1
+		}
+		sinkNoop = b
+	}
+
 	addr := os.Getenv("JACK_SERVICE_ADDR")
-	if addr == "" {
+	if addr == "" && !sinkNoop {
 		fmt.Fprintln(os.Stderr, "courier: JACK_SERVICE_ADDR environment variable is required")
 		return 1
 	}
@@ -78,6 +94,7 @@ func run(opts ...Option) int {
 		address:         addr,
 		shutdownTimeout: defaultShutdownTimeout,
 		submitTimeout:   defaultSubmitTimeout,
+		sinkNoop:        sinkNoop,
 		logger:          slog.New(slog.NewJSONHandler(os.Stdout, nil)),
 	}
 
@@ -112,11 +129,15 @@ func run(opts ...Option) int {
 		c.submitTimeout = d
 	}
 
-	if err := c.connect(); err != nil {
-		c.logger.Error("failed to connect to jack-service", slog.String("error", err.Error()))
-		return 1
+	if c.sinkNoop {
+		c.logger.Info("JACK_COURIER_SINK_NOOP enabled: jobs will be acknowledged without being enqueued to jack-service")
+	} else {
+		if err := c.connect(); err != nil {
+			c.logger.Error("failed to connect to jack-service", slog.String("error", err.Error()))
+			return 1
+		}
+		defer func() { _ = c.conn.Close() }()
 	}
-	defer func() { _ = c.conn.Close() }()
 
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer cancel()
@@ -221,15 +242,24 @@ func parsePositiveDuration(name, value string) (time.Duration, error) {
 // submit delivers a batch of jobs to jack-service via EnqueueBulk in a
 // single RPC. Per-job jack-service control fields (shadow, etc.) ride on
 // each job's InternalJackMeta bytes — no per-call gRPC metadata header,
-// no batch-splitting.
+// no batch-splitting. When sinkNoop is set, no RPC is made and every
+// job is reported as accepted.
 func (c *courier) submit(ctx context.Context, jobs []Job) ([]SubmitResult, error) {
 	if len(jobs) == 0 {
 		return nil, nil
 	}
-	return c.submitBatch(ctx, jobs)
-}
 
-func (c *courier) submitBatch(ctx context.Context, jobs []Job) ([]SubmitResult, error) {
+	if c.sinkNoop {
+		// acknowledge every job as accepted without calling jack-service
+		results := make([]SubmitResult, len(jobs))
+		for i, j := range jobs {
+			results[i] = SubmitResult{CorrelationID: j.CorrelationID, JobID: j.ID}
+		}
+		_ = c.statsd.Incr("jack.courier.submit.count", []string{"status:noop"}, 1)
+		_ = c.statsd.Distribution("jack.courier.submit.batch_size", float64(len(jobs)), nil, 1)
+		return results, nil
+	}
+
 	req := buildBulkRequest(jobs)
 
 	if c.submitTimeout > 0 {
