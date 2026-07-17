@@ -1,8 +1,12 @@
-.PHONY: test deps clean lint dev dev-clean
+.PHONY: test test/pubsub deps clean lint dev dev-clean
 
 # Run tests
 test:
 	go test -v -race ./...
+
+PUBSUB_TEST_HOST ?= localhost:5085
+test/pubsub:
+	JACK_COURIER_TEST_PUBSUB_HOST=$(PUBSUB_TEST_HOST) go test -v -race -count=1 -run Integration ./...
 
 # Download dependencies
 deps:
