@@ -2,7 +2,6 @@ package courier
 
 import (
 	"context"
-	"crypto/tls"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -10,16 +9,10 @@ import (
 	"os"
 	"os/signal"
 	"strconv"
-	"strings"
 	"syscall"
 	"time"
 
 	"github.com/DataDog/datadog-go/v5/statsd"
-	"github.com/clerk/jack/proto/jackpb"
-	"google.golang.org/grpc"
-	"google.golang.org/grpc/credentials"
-	"google.golang.org/grpc/credentials/insecure"
-	"google.golang.org/protobuf/types/known/timestamppb"
 )
 
 const (
@@ -30,38 +23,39 @@ const (
 
 type courier struct {
 	driver  Driver
-	address string
+	project string
 
 	shutdownTimeout time.Duration
 	submitTimeout   time.Duration
 	sinkNoop        bool
 	logger          *slog.Logger
-	tlsOverride     *bool
-	grpcDialOpts    []grpc.DialOption
 	statsd          statsd.ClientInterface
 
-	conn   *grpc.ClientConn
-	client jackpb.BackgroundJobsClient
+	publishers map[string]*queuePublisher
 }
 
 // Main is the entry point for a courier service. It loads configuration
-// from environment variables, sets up the gRPC connection to jack-service,
-// starts a health check HTTP server, and runs the registered driver.
+// from environment variables, builds one Pub/Sub publisher per configured
+// queue, starts a health check HTTP server, and runs the registered driver.
 //
 // Main blocks until a SIGINT or SIGTERM signal is received, then performs
 // a graceful shutdown.
 //
-// Required environment variables:
-//   - JACK_SERVICE_ADDR: jack-service gRPC address (e.g., "jack-service:50051").
-//     Not required when JACK_COURIER_SINK_NOOP is enabled.
+// Required environment variables (not required when JACK_COURIER_SINK_NOOP
+// is enabled):
+//   - JACK_COURIER_PUBSUB_PROJECT: GCP project ID of the Pub/Sub topics
+//   - JACK_COURIER_PUBSUB_TOPICS: comma-separated queue:topic pairs mapping
+//     each queue to the topic it publishes to
+//     (e.g., "high:clerk_jobs_high,low:clerk_jobs_low")
 //
 // Optional environment variables:
 //   - PORT: health check HTTP server port (default "8080")
 //   - JACK_COURIER_SHUTDOWN_TIMEOUT: graceful shutdown timeout (default "10s")
-//   - JACK_COURIER_SUBMIT_TIMEOUT: per-call EnqueueBulk timeout (default "30s")
-//   - JACK_COURIER_SINK_NOOP: if "true" or "1", never call jack-service;
+//   - JACK_COURIER_SUBMIT_TIMEOUT: per-submit publish deadline (default "30s")
+//   - JACK_COURIER_SINK_NOOP: if "true" or "1", never publish to Pub/Sub;
 //     submitted jobs are acknowledged as accepted and dropped. Used to
 //     validate drivers in production before the real sink is in place.
+//   - PUBSUB_EMULATOR_HOST: standard Pub/Sub emulator override for local dev
 func Main(opts ...Option) {
 	os.Exit(run(opts...))
 }
@@ -83,15 +77,33 @@ func run(opts ...Option) int {
 		sinkNoop = b
 	}
 
-	addr := os.Getenv("JACK_SERVICE_ADDR")
-	if addr == "" && !sinkNoop {
-		fmt.Fprintln(os.Stderr, "courier: JACK_SERVICE_ADDR environment variable is required")
+	project := os.Getenv("JACK_COURIER_PUBSUB_PROJECT")
+	if project == "" && !sinkNoop {
+		fmt.Fprintln(os.Stderr, "courier: JACK_COURIER_PUBSUB_PROJECT environment variable is required")
 		return 1
+	}
+
+	rawTopics := os.Getenv("JACK_COURIER_PUBSUB_TOPICS")
+	if rawTopics == "" && !sinkNoop {
+		fmt.Fprintln(os.Stderr, "courier: JACK_COURIER_PUBSUB_TOPICS environment variable is required")
+		return 1
+	}
+
+	// The noop sink ignores the Pub/Sub configuration entirely; the deploy
+	// that turns noop off validates it.
+	var topics map[string]string
+	if !sinkNoop {
+		var err error
+		topics, err = parseTopicMap(rawTopics)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "courier: invalid JACK_COURIER_PUBSUB_TOPICS: %v\n", err)
+			return 1
+		}
 	}
 
 	c := &courier{
 		driver:          driver,
-		address:         addr,
+		project:         project,
 		shutdownTimeout: defaultShutdownTimeout,
 		submitTimeout:   defaultSubmitTimeout,
 		sinkNoop:        sinkNoop,
@@ -130,13 +142,10 @@ func run(opts ...Option) int {
 	}
 
 	if c.sinkNoop {
-		c.logger.Info("JACK_COURIER_SINK_NOOP enabled: jobs will be acknowledged without being enqueued to jack-service")
-	} else {
-		if err := c.connect(); err != nil {
-			c.logger.Error("failed to connect to jack-service", slog.String("error", err.Error()))
-			return 1
-		}
-		defer func() { _ = c.conn.Close() }()
+		c.logger.Info("JACK_COURIER_SINK_NOOP enabled: jobs will be acknowledged without being published to Pub/Sub")
+	} else if err := c.buildPublishers(context.Background(), topics); err != nil {
+		c.logger.Error("failed to create pubsub publishers", slog.String("error", err.Error()))
+		return 1
 	}
 
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
@@ -167,7 +176,8 @@ func run(opts ...Option) int {
 	}()
 
 	c.logger.Info("courier started",
-		slog.String("jack_service_addr", c.address),
+		slog.String("pubsub_project", project),
+		slog.Any("pubsub_topics", topics),
 		slog.String("health_port", port),
 	)
 
@@ -192,6 +202,10 @@ func (c *courier) run(ctx context.Context, server *http.Server) int {
 
 	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), c.shutdownTimeout)
 	defer shutdownCancel()
+
+	// The publisher flush shares the shutdown budget with the driver drain,
+	// so the shutdown timeout bounds total termination time as documented.
+	defer c.stopPublishers(shutdownCtx)
 
 	if !driverExited {
 		var abandoned bool
@@ -237,148 +251,4 @@ func parsePositiveDuration(name, value string) (time.Duration, error) {
 		return 0, fmt.Errorf("%s must be > 0, got %s", name, d)
 	}
 	return d, nil
-}
-
-// submit delivers a batch of jobs to jack-service via EnqueueBulk in a
-// single RPC. Per-job jack-service control fields (shadow, etc.) ride on
-// each job's InternalJackMeta bytes — no per-call gRPC metadata header,
-// no batch-splitting. When sinkNoop is set, no RPC is made and every
-// job is reported as accepted.
-func (c *courier) submit(ctx context.Context, jobs []Job) ([]SubmitResult, error) {
-	if len(jobs) == 0 {
-		return nil, nil
-	}
-
-	if c.sinkNoop {
-		// acknowledge every job as accepted without calling jack-service
-		results := make([]SubmitResult, len(jobs))
-		for i, j := range jobs {
-			results[i] = SubmitResult{CorrelationID: j.CorrelationID, JobID: j.ID}
-		}
-		_ = c.statsd.Incr("jack.courier.submit.count", []string{"status:noop"}, 1)
-		_ = c.statsd.Distribution("jack.courier.submit.batch_size", float64(len(jobs)), nil, 1)
-		return results, nil
-	}
-
-	req := buildBulkRequest(jobs)
-
-	if c.submitTimeout > 0 {
-		var cancel context.CancelFunc
-		ctx, cancel = context.WithTimeout(ctx, c.submitTimeout)
-		defer cancel()
-	}
-
-	start := time.Now()
-	resp, err := c.client.EnqueueBulk(ctx, req)
-	if err != nil {
-		_ = c.statsd.Incr("jack.courier.submit.count", []string{"status:error"}, 1)
-		return nil, fmt.Errorf("courier: EnqueueBulk: %w", err)
-	}
-
-	_ = c.statsd.Incr("jack.courier.submit.count", []string{"status:success"}, 1)
-	_ = c.statsd.Distribution("jack.courier.submit.duration", time.Since(start).Seconds(), nil, 1)
-	_ = c.statsd.Distribution("jack.courier.submit.batch_size", float64(len(jobs)), nil, 1)
-
-	results := collectResults(resp)
-
-	var failCount int
-	for _, r := range results {
-		if r.Err != "" {
-			failCount++
-		}
-	}
-	_ = c.statsd.Count("jack.courier.submit.jobs", int64(len(results)-failCount), []string{"status:success"}, 1)
-	if failCount > 0 {
-		_ = c.statsd.Count("jack.courier.submit.jobs", int64(failCount), []string{"status:error"}, 1)
-	}
-
-	for i, r := range results {
-		if len(r.ErrorMessages) == 0 {
-			continue
-		}
-		var tags []string
-		if i < len(jobs) {
-			tags = []string{"job_type:" + jobs[i].JobType}
-		}
-		_ = c.statsd.Incr("jack.courier.warnings.count", tags, 1)
-		c.logger.Warn("jack accepted job with warnings",
-			slog.String("correlation_id", r.CorrelationID),
-			slog.String("job_id", r.JobID),
-			slog.Any("warnings", r.ErrorMessages),
-		)
-	}
-
-	return results, nil
-}
-
-// buildBulkRequest converts a slice of Job to an EnqueueBulkRequest.
-func buildBulkRequest(jobs []Job) *jackpb.EnqueueBulkRequest {
-	reqs := make([]*jackpb.EnqueueRequest, len(jobs))
-	for i, j := range jobs {
-		req := &jackpb.EnqueueRequest{
-			ProducerId:       j.ProducerID,
-			JobType:          j.JobType,
-			Payload:          j.Payload,
-			TraceId:          j.TraceID,
-			CorrelationId:    j.CorrelationID,
-			JobId:            j.ID,
-			InternalJackMeta: j.InternalJackMeta,
-			IdempotencyKey:   j.IdempotencyKey,
-		}
-		if !j.RunAt.IsZero() {
-			req.RunAt = timestamppb.New(j.RunAt)
-		}
-		reqs[i] = req
-	}
-	return &jackpb.EnqueueBulkRequest{Jobs: reqs}
-}
-
-// collectResults maps BulkResult entries to SubmitResults.
-// CorrelationID is echoed directly from the proto response.
-func collectResults(resp *jackpb.EnqueueBulkResponse) []SubmitResult {
-	if resp == nil {
-		return nil
-	}
-
-	results := make([]SubmitResult, len(resp.Results))
-	for i, r := range resp.Results {
-		results[i] = SubmitResult{
-			CorrelationID: r.CorrelationId,
-			JobID:         r.JobId,
-			Err:           r.Error,
-			Reason:        r.Reason,
-			ErrorMessages: r.ErrorMessages,
-		}
-	}
-	return results
-}
-
-// connect establishes the gRPC connection to jack-service.
-func (c *courier) connect() error {
-	useTLS := c.shouldUseTLS()
-
-	var transportCreds grpc.DialOption
-	if useTLS {
-		transportCreds = grpc.WithTransportCredentials(credentials.NewTLS(&tls.Config{}))
-	} else {
-		transportCreds = grpc.WithTransportCredentials(insecure.NewCredentials())
-	}
-
-	dialOpts := append([]grpc.DialOption{transportCreds}, c.grpcDialOpts...)
-
-	conn, err := grpc.NewClient(c.address, dialOpts...)
-	if err != nil {
-		return err
-	}
-
-	c.conn = conn
-	c.client = jackpb.NewBackgroundJobsClient(conn)
-	return nil
-}
-
-func (c *courier) shouldUseTLS() bool {
-	if c.tlsOverride != nil {
-		return *c.tlsOverride
-	}
-	return strings.HasSuffix(c.address, ":443")
 }
