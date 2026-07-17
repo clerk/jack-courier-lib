@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strconv"
 	"syscall"
 	"time"
 
@@ -26,6 +27,7 @@ type courier struct {
 
 	shutdownTimeout time.Duration
 	submitTimeout   time.Duration
+	sinkNoop        bool
 	logger          *slog.Logger
 	statsd          statsd.ClientInterface
 
@@ -39,7 +41,8 @@ type courier struct {
 // Main blocks until a SIGINT or SIGTERM signal is received, then performs
 // a graceful shutdown.
 //
-// Required environment variables:
+// Required environment variables (not required when JACK_COURIER_SINK_NOOP
+// is enabled):
 //   - JACK_COURIER_PUBSUB_PROJECT: GCP project ID of the Pub/Sub topics
 //   - JACK_COURIER_PUBSUB_TOPICS: comma-separated queue:topic pairs mapping
 //     each queue to the topic it publishes to
@@ -49,6 +52,9 @@ type courier struct {
 //   - PORT: health check HTTP server port (default "8080")
 //   - JACK_COURIER_SHUTDOWN_TIMEOUT: graceful shutdown timeout (default "10s")
 //   - JACK_COURIER_SUBMIT_TIMEOUT: per-submit publish deadline (default "30s")
+//   - JACK_COURIER_SINK_NOOP: if "true" or "1", never publish to Pub/Sub;
+//     submitted jobs are acknowledged as accepted and dropped. Used to
+//     validate drivers in production before the real sink is in place.
 //   - PUBSUB_EMULATOR_HOST: standard Pub/Sub emulator override for local dev
 func Main(opts ...Option) {
 	os.Exit(run(opts...))
@@ -61,22 +67,38 @@ func run(opts ...Option) int {
 		return 1
 	}
 
+	sinkNoop := false
+	if v := os.Getenv("JACK_COURIER_SINK_NOOP"); v != "" {
+		b, err := strconv.ParseBool(v)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "courier: invalid JACK_COURIER_SINK_NOOP: %v\n", err)
+			return 1
+		}
+		sinkNoop = b
+	}
+
 	project := os.Getenv("JACK_COURIER_PUBSUB_PROJECT")
-	if project == "" {
+	if project == "" && !sinkNoop {
 		fmt.Fprintln(os.Stderr, "courier: JACK_COURIER_PUBSUB_PROJECT environment variable is required")
 		return 1
 	}
 
 	rawTopics := os.Getenv("JACK_COURIER_PUBSUB_TOPICS")
-	if rawTopics == "" {
+	if rawTopics == "" && !sinkNoop {
 		fmt.Fprintln(os.Stderr, "courier: JACK_COURIER_PUBSUB_TOPICS environment variable is required")
 		return 1
 	}
 
-	topics, err := parseTopicMap(rawTopics)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "courier: invalid JACK_COURIER_PUBSUB_TOPICS: %v\n", err)
-		return 1
+	// The noop sink ignores the Pub/Sub configuration entirely; the deploy
+	// that turns noop off validates it.
+	var topics map[string]string
+	if !sinkNoop {
+		var err error
+		topics, err = parseTopicMap(rawTopics)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "courier: invalid JACK_COURIER_PUBSUB_TOPICS: %v\n", err)
+			return 1
+		}
 	}
 
 	c := &courier{
@@ -84,6 +106,7 @@ func run(opts ...Option) int {
 		project:         project,
 		shutdownTimeout: defaultShutdownTimeout,
 		submitTimeout:   defaultSubmitTimeout,
+		sinkNoop:        sinkNoop,
 		logger:          slog.New(slog.NewJSONHandler(os.Stdout, nil)),
 	}
 
@@ -118,7 +141,9 @@ func run(opts ...Option) int {
 		c.submitTimeout = d
 	}
 
-	if err := c.buildPublishers(context.Background(), topics); err != nil {
+	if c.sinkNoop {
+		c.logger.Info("JACK_COURIER_SINK_NOOP enabled: jobs will be acknowledged without being published to Pub/Sub")
+	} else if err := c.buildPublishers(context.Background(), topics); err != nil {
 		c.logger.Error("failed to create pubsub publishers", slog.String("error", err.Error()))
 		return 1
 	}

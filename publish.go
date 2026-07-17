@@ -97,7 +97,8 @@ func (c *courier) stopPublishers(ctx context.Context) {
 }
 
 // submit publishes a batch of jobs to their queues' Pub/Sub topics and maps
-// per-message outcomes onto SubmitResults.
+// per-message outcomes onto SubmitResults. When sinkNoop is set, nothing is
+// published and every job is reported as accepted.
 func (c *courier) submit(ctx context.Context, jobs []Job) ([]SubmitResult, error) {
 	if len(jobs) == 0 {
 		return nil, nil
@@ -109,6 +110,18 @@ func (c *courier) submit(ctx context.Context, jobs []Job) ([]SubmitResult, error
 	// error identity for the shutdown path (errors.Is(context.Canceled)).
 	if err := ctx.Err(); err != nil {
 		return nil, fmt.Errorf("courier: submit: %w", err)
+	}
+
+	if c.sinkNoop {
+		// Acknowledge every job as accepted without publishing. Queues are
+		// not validated: noop mode runs without any topic configuration.
+		results := make([]SubmitResult, len(jobs))
+		for i, j := range jobs {
+			results[i] = SubmitResult{CorrelationID: j.CorrelationID, JobID: j.ID}
+		}
+		_ = c.statsd.Incr("jack.courier.submit.count", []string{"status:noop", "queue:" + jobs[0].Queue}, 1)
+		_ = c.statsd.Distribution("jack.courier.submit.batch_size", float64(len(jobs)), []string{"queue:" + jobs[0].Queue}, 1)
+		return results, nil
 	}
 
 	// An unmapped queue is a config error. Reject the batch before publishing

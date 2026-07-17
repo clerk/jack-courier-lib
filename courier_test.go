@@ -162,6 +162,42 @@ func TestRun_SignalDriverAbandonedOnTimeout(t *testing.T) {
 	}
 }
 
+// TestRun_SinkNoopEndToEnd exercises the full run() path with
+// JACK_COURIER_SINK_NOOP: the Pub/Sub configuration is not required, no
+// publishers are built, and the driver's submits are acknowledged.
+func TestRun_SinkNoopEndToEnd(t *testing.T) {
+	t.Setenv("JACK_COURIER_SINK_NOOP", "true")
+	t.Setenv("JACK_COURIER_PUBSUB_PROJECT", "")
+	t.Setenv("JACK_COURIER_PUBSUB_TOPICS", "")
+	t.Setenv("PORT", "0")
+
+	var got []SubmitResult
+	var submitErr error
+	swapDriver(t, fakeDriver{run: func(ctx context.Context, submit SubmitFunc) error {
+		got, submitErr = submit(ctx, []Job{{CorrelationID: "c1", ID: "psjob_abc", Queue: "high", ProducerID: "p", JobType: "email"}})
+		return nil
+	}})
+
+	if code := run(WithLogger(discardLogger())); code != 0 {
+		t.Fatalf("expected exit code 0, got %d", code)
+	}
+	if submitErr != nil {
+		t.Fatalf("submit returned error: %v", submitErr)
+	}
+	if len(got) != 1 || got[0].CorrelationID != "c1" || got[0].JobID != "psjob_abc" || got[0].Err != "" {
+		t.Fatalf("unexpected results: %+v", got)
+	}
+}
+
+func TestRun_InvalidSinkNoop(t *testing.T) {
+	t.Setenv("JACK_COURIER_SINK_NOOP", "banana")
+	swapDriver(t, &noopDriver{})
+
+	if code := run(WithLogger(discardLogger())); code != 1 {
+		t.Fatalf("expected exit code 1 for invalid JACK_COURIER_SINK_NOOP, got %d", code)
+	}
+}
+
 func TestDrainDriver_ReturnsWithinBudget(t *testing.T) {
 	driverErr := errors.New("driver stopped")
 	done := make(chan error, 1)
@@ -208,6 +244,23 @@ func (d fakeDriver) Run(ctx context.Context, submit SubmitFunc) error {
 
 func discardLogger() *slog.Logger {
 	return slog.New(slog.NewTextHandler(io.Discard, nil))
+}
+
+// swapDriver registers d for the duration of the test, restoring the
+// previous global registration afterwards.
+func swapDriver(t *testing.T, d Driver) {
+	t.Helper()
+
+	driverMu.Lock()
+	origDriver, origRegistered := registeredDriver, driverRegistered
+	registeredDriver, driverRegistered = d, true
+	driverMu.Unlock()
+
+	t.Cleanup(func() {
+		driverMu.Lock()
+		registeredDriver, driverRegistered = origDriver, origRegistered
+		driverMu.Unlock()
+	})
 }
 
 type noopDriver struct{}

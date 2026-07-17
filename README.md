@@ -50,6 +50,7 @@ Optional:
 
 - `JACK_COURIER_SUBMIT_TIMEOUT` — deadline applied to each submit call's publishes, parsed as a Go duration (e.g. `30s`, `1m`). Defaults to `30s`. The driver's lifecycle context still controls overall shutdown; this only bounds an individual submit so a stalled Pub/Sub cannot hang the courier. It also caps the client's own publish attempts, so an abandoned publish stops retrying in the background.
 - `JACK_COURIER_SHUTDOWN_TIMEOUT` — graceful shutdown timeout, parsed as a Go duration. Defaults to `10s`. On `SIGINT`/`SIGTERM` this bounds total termination time. If the driver does not return within it, the driver is abandoned and the process exits anyway, so the courier never takes longer than the timeout to shut down.
+- `JACK_COURIER_SINK_NOOP` — if `true` or `1`, the courier never publishes to Pub/Sub: submitted jobs are acknowledged as accepted and dropped, and the `JACK_COURIER_PUBSUB_*` variables are not required. Used to validate drivers end-to-end in production (partitioning, batching, cursor advancement) before the real sink is in place.
 - `PUBSUB_EMULATOR_HOST` — standard Pub/Sub emulator override for local development.
 
 ## Error semantics

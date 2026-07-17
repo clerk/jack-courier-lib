@@ -467,6 +467,43 @@ func TestSubmit_EmitsMetrics(t *testing.T) {
 	}
 }
 
+func TestSubmit_SinkNoop(t *testing.T) {
+	rec := &recordingStatsd{ClientInterface: &statsd.NoOpClient{}}
+	// No publishers configured: any publish or queue lookup would reject the
+	// batch, so passing results prove the noop branch short-circuits.
+	c := &courier{
+		logger:   discardLogger(),
+		statsd:   rec,
+		sinkNoop: true,
+	}
+
+	jobs := []Job{
+		{CorrelationID: "c1", ID: "psjob_abc", Queue: "high", ProducerID: "prod_1", JobType: "email"},
+		{CorrelationID: "c2", Queue: "low", ProducerID: "prod_1", JobType: "sms"},
+	}
+
+	results, err := c.submit(t.Context(), jobs)
+	if err != nil {
+		t.Fatalf("submit returned error: %v", err)
+	}
+
+	if len(results) != 2 {
+		t.Fatalf("expected 2 results, got %d", len(results))
+	}
+	if results[0].CorrelationID != "c1" || results[0].JobID != "psjob_abc" || results[0].Err != "" {
+		t.Errorf("unexpected result[0]: %+v", results[0])
+	}
+	if results[1].CorrelationID != "c2" || results[1].JobID != "" || results[1].Err != "" {
+		t.Errorf("unexpected result[1]: %+v", results[1])
+	}
+	if got := rec.incrTags("jack.courier.submit.count"); !hasTag(got, "status:noop") || !hasTag(got, "queue:high") {
+		t.Errorf("submit.count tags = %v, want status:noop and queue:high", got)
+	}
+	if got := rec.distributionValue("jack.courier.submit.batch_size"); got != 2 {
+		t.Errorf("submit.batch_size = %v, want 2", got)
+	}
+}
+
 // newStalledCourier builds a courier whose Publish RPCs always fail with a
 // retryable code, so publishes stay pending in the client indefinitely.
 func newStalledCourier(t *testing.T) *courier {
