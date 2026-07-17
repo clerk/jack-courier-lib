@@ -8,6 +8,10 @@ import (
 	"net/http"
 	"testing"
 	"time"
+
+	"cloud.google.com/go/pubsub/v2"
+	"cloud.google.com/go/pubsub/v2/apiv1/pubsubpb"
+	"cloud.google.com/go/pubsub/v2/pstest"
 )
 
 func TestParsePositiveDuration(t *testing.T) {
@@ -195,6 +199,91 @@ func TestRun_InvalidSinkNoop(t *testing.T) {
 
 	if code := run(WithLogger(discardLogger())); code != 1 {
 		t.Fatalf("expected exit code 1 for invalid JACK_COURIER_SINK_NOOP, got %d", code)
+	}
+}
+
+func TestRun_InvalidConfig(t *testing.T) {
+	tests := []struct {
+		name string
+		env  map[string]string
+		opts []Option
+	}{
+		{"missing project", map[string]string{"JACK_COURIER_PUBSUB_PROJECT": ""}, nil},
+		{"missing topics", map[string]string{"JACK_COURIER_PUBSUB_TOPICS": ""}, nil},
+		{"invalid topic map", map[string]string{"JACK_COURIER_PUBSUB_TOPICS": "no-colon"}, nil},
+		{"malformed shutdown timeout", map[string]string{"JACK_COURIER_SHUTDOWN_TIMEOUT": "nope"}, nil},
+		{"non-positive submit timeout", map[string]string{"JACK_COURIER_SUBMIT_TIMEOUT": "0s"}, nil},
+		{"failing option", nil, []Option{WithLogger(nil)}},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			// A driver that exits immediately: if a case wrongly passes
+			// validation, run() returns 0 and the test fails fast instead
+			// of hanging. The bogus emulator host keeps any wrongly-built
+			// publisher away from real credentials.
+			swapDriver(t, fakeDriver{run: func(context.Context, SubmitFunc) error { return nil }})
+			t.Setenv("PUBSUB_EMULATOR_HOST", "127.0.0.1:1")
+			t.Setenv("JACK_COURIER_SINK_NOOP", "")
+			t.Setenv("JACK_COURIER_PUBSUB_PROJECT", "test-project")
+			t.Setenv("JACK_COURIER_PUBSUB_TOPICS", "high:topic_high")
+			t.Setenv("JACK_COURIER_SHUTDOWN_TIMEOUT", "")
+			t.Setenv("JACK_COURIER_SUBMIT_TIMEOUT", "")
+			for k, v := range tt.env {
+				t.Setenv(k, v)
+			}
+
+			opts := append([]Option{WithLogger(discardLogger())}, tt.opts...)
+			if code := run(opts...); code != 1 {
+				t.Fatalf("expected exit code 1, got %d", code)
+			}
+		})
+	}
+}
+
+// TestRun_PublishesEndToEnd exercises the full non-noop run() path against
+// the emulator: env config, publisher construction, a driver submit that
+// publishes for real, and a clean shutdown.
+func TestRun_PublishesEndToEnd(t *testing.T) {
+	srv := pstest.NewServer()
+	t.Cleanup(func() { _ = srv.Close() })
+	t.Setenv("PUBSUB_EMULATOR_HOST", srv.Addr)
+
+	admin, err := pubsub.NewClient(t.Context(), "test-project")
+	if err != nil {
+		t.Fatalf("admin client: %v", err)
+	}
+	if _, err := admin.TopicAdminClient.CreateTopic(t.Context(), &pubsubpb.Topic{
+		Name: "projects/test-project/topics/topic_high",
+	}); err != nil {
+		t.Fatalf("create topic: %v", err)
+	}
+	_ = admin.Close()
+
+	t.Setenv("JACK_COURIER_SINK_NOOP", "")
+	t.Setenv("JACK_COURIER_PUBSUB_PROJECT", "test-project")
+	t.Setenv("JACK_COURIER_PUBSUB_TOPICS", "high:topic_high")
+	t.Setenv("PORT", "0")
+
+	var got []SubmitResult
+	var submitErr error
+	swapDriver(t, fakeDriver{run: func(ctx context.Context, submit SubmitFunc) error {
+		got, submitErr = submit(ctx, []Job{{CorrelationID: "c1", ID: "psjob_1", Queue: "high", Payload: []byte("x")}})
+		return nil
+	}})
+
+	if code := run(WithLogger(discardLogger())); code != 0 {
+		t.Fatalf("expected exit code 0, got %d", code)
+	}
+	if submitErr != nil {
+		t.Fatalf("submit returned error: %v", submitErr)
+	}
+	if len(got) != 1 || got[0].Err != "" {
+		t.Fatalf("unexpected results: %+v", got)
+	}
+	msgs := srv.Messages()
+	if len(msgs) != 1 || string(msgs[0].Data) != "x" {
+		t.Fatalf("expected the job published verbatim, got %d messages", len(msgs))
 	}
 }
 

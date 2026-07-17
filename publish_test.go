@@ -406,6 +406,39 @@ func TestSubmit_MissingTopicFailsBatchRetryably(t *testing.T) {
 	}
 }
 
+func TestSubmit_PartialRetryableFailureReturnsResults(t *testing.T) {
+	// One queue's topic exists, the other's is never created: its publishes
+	// fail with NotFound (retryable). The batch must resolve per-job, since
+	// the published sibling was acked to the driver; a batch error would
+	// make the driver retry the whole batch and duplicate the published job.
+	c, srv := newPubsubCourier(t,
+		map[string]string{"high": "topic_high", "low": "topic_missing"},
+		[]string{"topic_high"},
+	)
+
+	jobs := []Job{
+		{CorrelationID: "1", ID: "a", Queue: "high", Payload: []byte("x")},
+		{CorrelationID: "2", ID: "b", Queue: "low", Payload: []byte("y")},
+	}
+
+	results, err := c.submit(t.Context(), jobs)
+	if err != nil {
+		t.Fatalf("expected per-job results, got batch error: %v", err)
+	}
+	if results[0].Err != "" {
+		t.Errorf("published job failed: %s", results[0].Err)
+	}
+	if results[1].Err == "" {
+		t.Error("expected the missing-topic job to fail")
+	}
+	if results[1].Reason != "" {
+		t.Errorf("Reason = %q, want empty (retryable)", results[1].Reason)
+	}
+	if n := len(srv.Messages()); n != 1 {
+		t.Errorf("expected only the mapped queue's job published, got %d messages", n)
+	}
+}
+
 func TestSubmit_OversizedJobFailsPermanentlyNotBatch(t *testing.T) {
 	// A batch made entirely of permanently-failing jobs must resolve per-job
 	// (payload_too_large → DLQ), not as a batch error: a batch error would
