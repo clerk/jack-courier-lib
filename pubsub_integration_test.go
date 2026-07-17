@@ -4,7 +4,9 @@ import (
 	"context"
 	"crypto/rand"
 	"fmt"
+	"maps"
 	"os"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -22,7 +24,7 @@ import (
 const (
 	emulatorHostEnv = "JACK_COURIER_TEST_PUBSUB_HOST"
 	emulatorProject = "clerk-local"
-	receiveTimeout  = 30 * time.Second
+	receiveTimeout  = 10 * time.Second
 	setupTimeout    = 10 * time.Second
 )
 
@@ -91,6 +93,70 @@ func TestIntegration_SubmitRoundTrip(t *testing.T) {
 			assert.Equal(t, tc.job.TraceID, msg.Attributes["trace_id"], "trace_id attribute")
 			assert.Equal(t, tc.job.ProducerID, msg.Attributes["producer_id"], "producer_id attribute")
 			assert.Equal(t, tc.wantShadow, msg.Attributes["shadow"], "shadow attribute")
+		})
+	}
+}
+
+// TestIntegration_RunRoutesQueuesToTopics drives the whole entry point rather
+// than submit() alone: run() parses JACK_COURIER_PUBSUB_TOPICS, builds a
+// publisher per queue, and routes a mixed batch to three real topics.
+func TestIntegration_RunRoutesQueuesToTopics(t *testing.T) {
+	requireEmulator(t)
+
+	admin, err := pubsub.NewClient(t.Context(), emulatorProject)
+	require.NoError(t, err, "admin client")
+	t.Cleanup(func() { _ = admin.Close() })
+
+	queues := []struct{ name, topic, sub string }{
+		{name: "high"}, {name: "medium"}, {name: "low"},
+	}
+	pairs := make([]string, len(queues))
+	for i, q := range queues {
+		topicID, subID := newEmulatorTopic(t, admin, "clerk_jobs_"+q.name)
+		queues[i].topic, queues[i].sub = topicID, subID
+		pairs[i] = q.name + ":" + topicID
+	}
+
+	t.Setenv("JACK_COURIER_PUBSUB_PROJECT", emulatorProject)
+	t.Setenv("JACK_COURIER_PUBSUB_TOPICS", strings.Join(pairs, ","))
+	// An exported noop would ack every job without publishing, so pin it off.
+	t.Setenv("JACK_COURIER_SINK_NOOP", "")
+	t.Setenv("PORT", "0")
+
+	var results []SubmitResult
+	var submitErr error
+	swapDriver(t, fakeDriver{run: func(ctx context.Context, submit SubmitFunc) error {
+		jobs := make([]Job, len(queues))
+		for i, q := range queues {
+			jobs[i] = Job{
+				CorrelationID: "outbox-" + q.name,
+				ID:            "psjob_" + q.name,
+				Queue:         q.name,
+				ProducerID:    "svc_courier_test",
+				JobType:       "test.run",
+				Payload:       []byte(`{"queue":"` + q.name + `"}`),
+			}
+		}
+		results, submitErr = submit(ctx, jobs)
+		return nil
+	}})
+
+	require.Equal(t, 0, run(WithLogger(discardLogger())), "run exit code")
+	require.NoError(t, submitErr, "submit")
+	require.Len(t, results, len(queues))
+	for _, r := range results {
+		require.Emptyf(t, r.Err, "job %s failed to publish", r.JobID)
+	}
+
+	// Each queue's subscription must carry that queue's own job: a routing bug
+	// delivers the wrong job_id here, or nothing at all.
+	for _, q := range queues {
+		t.Run(q.name, func(t *testing.T) {
+			got := receiveN(t, admin, q.sub, 1)
+
+			msg, ok := got["psjob_"+q.name]
+			require.Truef(t, ok, "queue %s: topic %s carried %v", q.name, q.topic, slices.Collect(maps.Keys(got)))
+			assert.JSONEq(t, `{"queue":"`+q.name+`"}`, string(msg.Data), "payload")
 		})
 	}
 }
