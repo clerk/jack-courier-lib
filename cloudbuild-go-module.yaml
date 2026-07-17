@@ -1,6 +1,7 @@
 # Cloud Build configuration for publishing jack-courier-lib to Artifact Registry.
 #
-# Triggered by pushing a semver tag (e.g. v0.1.0).
+# Triggered by pushing a semver tag, which must be v2.x.y to match the
+# module's /v2 path (e.g. v2.0.0).
 # Publishes the Go module to the go-modules AR repository.
 steps:
   - id: publish-go-module
