@@ -69,3 +69,30 @@ jobs:
         with:
           go-version-file: go.mod
       - run: make test
+
+  test-pubsub:
+    name: Test (Pub/Sub emulator)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Configure private Go modules
+        run: |
+          if [ -n "${GO_MODULES_TOKEN:-}" ]; then
+            git config --global url."https://x-access-token:${GO_MODULES_TOKEN}@github.com/clerk/".insteadOf "https://github.com/clerk/"
+            echo "GOPRIVATE=github.com/clerk/*" >> "$GITHUB_ENV"
+          else
+            echo "::warning::GO_MODULES_TOKEN is unset; skipping private Go module configuration. Private clerk modules may fail to resolve."
+          fi
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      # Same image and start command as clerk_go's `make up/pubsub`, so CI
+      # exercises the emulator the tests were written against. A plain
+      # `docker run` because service containers cannot override the command.
+      - name: Start Pub/Sub emulator
+        run: |
+          docker run -d --name pubsub-emulator -p 5085:5085 \
+            gcr.io/google.com/cloudsdktool/google-cloud-cli:emulators \
+            gcloud --quiet beta emulators pubsub start --project=clerk-local --host-port=0.0.0.0:5085
+          timeout 60 bash -c 'until (echo > /dev/tcp/localhost/5085) 2>/dev/null; do sleep 1; done'
+      - run: make test/pubsub
