@@ -78,8 +78,8 @@ func TestClassifyPublishError(t *testing.T) {
 		err  error
 		want string
 	}{
-		{"oversized message is permanent", pubsub.ErrOversizedMessage, reasonPayloadTooLarge},
-		{"wrapped oversized message is permanent", fmt.Errorf("wrap: %w", pubsub.ErrOversizedMessage), reasonPayloadTooLarge},
+		{"oversized message is permanent", pubsub.ErrOversizedMessage, ReasonPayloadTooLarge},
+		{"wrapped oversized message is permanent", fmt.Errorf("wrap: %w", pubsub.ErrOversizedMessage), ReasonPayloadTooLarge},
 		// InvalidArgument is request-level (one Publish RPC carries the whole
 		// batch), so it may reflect config problems and must not dead-letter.
 		{"invalid argument is retryable", status.Error(codes.InvalidArgument, "bad topic"), ""},
@@ -349,7 +349,7 @@ func TestSubmit_MalformedMetaFailsJobNotBatch(t *testing.T) {
 	if err != nil {
 		t.Fatalf("expected per-job failure, got batch error: %v", err)
 	}
-	if results[0].Err == "" || results[0].Reason != reasonValidationError {
+	if results[0].Err == "" || results[0].Reason != ReasonValidationError {
 		t.Errorf("bad-meta job: Err=%q Reason=%q, want validation_error", results[0].Err, results[0].Reason)
 	}
 	if results[1].Err != "" {
@@ -426,8 +426,124 @@ func TestSubmit_OversizedJobFailsPermanentlyNotBatch(t *testing.T) {
 	if err != nil {
 		t.Fatalf("expected per-job failure, got batch error: %v", err)
 	}
-	if results[0].Err == "" || results[0].Reason != reasonPayloadTooLarge {
+	if results[0].Err == "" || results[0].Reason != ReasonPayloadTooLarge {
 		t.Errorf("oversized job: Err=%q Reason=%q, want payload_too_large", results[0].Err, results[0].Reason)
+	}
+}
+
+func TestSubmit_NotYetDueJobsAreHeldNotPublished(t *testing.T) {
+	// Nothing delays a published message yet, so a job scheduled beyond the
+	// leeway must go back to the driver instead of running early.
+	c, srv := newPubsubCourier(t,
+		map[string]string{"high": "topic_high"},
+		[]string{"topic_high"},
+	)
+
+	jobs := []Job{
+		{CorrelationID: "1", ID: "a", Queue: "high", Payload: []byte("now")},
+		{CorrelationID: "2", ID: "b", Queue: "high", Payload: []byte("later"), RunAt: time.Now().Add(time.Hour)},
+	}
+
+	results, err := c.submit(t.Context(), jobs)
+	if err != nil {
+		t.Fatalf("submit: %v", err)
+	}
+	if results[0].Err != "" {
+		t.Errorf("due job: Err=%q, want published", results[0].Err)
+	}
+	if results[1].Reason != ReasonNotYetDue || results[1].Err == "" {
+		t.Errorf("future job: Err=%q Reason=%q, want not_yet_due", results[1].Err, results[1].Reason)
+	}
+
+	msgs := srv.Messages()
+	if len(msgs) != 1 {
+		t.Fatalf("published %d messages, want 1 (the future job must not be published)", len(msgs))
+	}
+	if got := string(msgs[0].Data); got != "now" {
+		t.Errorf("published payload = %q, want %q", got, "now")
+	}
+}
+
+func TestSubmit_JobDueWithinLeewayIsPublished(t *testing.T) {
+	// A job due imminently stays on the fast path rather than bouncing back
+	// to the driver for one more round trip.
+	c, srv := newPubsubCourier(t,
+		map[string]string{"high": "topic_high"},
+		[]string{"topic_high"},
+	)
+
+	jobs := []Job{{
+		CorrelationID: "1",
+		ID:            "a",
+		Queue:         "high",
+		Payload:       []byte("soon"),
+		RunAt:         time.Now().Add(futureJobLeeway / 2),
+	}}
+
+	results, err := c.submit(t.Context(), jobs)
+	if err != nil {
+		t.Fatalf("submit: %v", err)
+	}
+	if results[0].Err != "" {
+		t.Errorf("job due within leeway: Err=%q, want published", results[0].Err)
+	}
+	if n := len(srv.Messages()); n != 1 {
+		t.Errorf("published %d messages, want 1", n)
+	}
+}
+
+func TestSubmit_AllNotYetDueResolvesPerJobNotBatchError(t *testing.T) {
+	// A batch where every job is deferred must resolve per-job: a batch error
+	// would tell the driver publishing is broken and make it back off, which
+	// would delay these jobs past their RunAt.
+	c, srv := newPubsubCourier(t,
+		map[string]string{"high": "topic_high"},
+		[]string{"topic_high"},
+	)
+
+	future := time.Now().Add(time.Hour)
+	jobs := []Job{
+		{CorrelationID: "1", ID: "a", Queue: "high", Payload: []byte("x"), RunAt: future},
+		{CorrelationID: "2", ID: "b", Queue: "high", Payload: []byte("y"), RunAt: future},
+	}
+
+	results, err := c.submit(t.Context(), jobs)
+	if err != nil {
+		t.Fatalf("expected per-job deferrals, got batch error: %v", err)
+	}
+	for i, r := range results {
+		if r.Reason != ReasonNotYetDue {
+			t.Errorf("job %d: Reason=%q, want not_yet_due", i, r.Reason)
+		}
+	}
+	if n := len(srv.Messages()); n != 0 {
+		t.Errorf("published %d messages, want 0", n)
+	}
+}
+
+func TestSubmit_MalformedMetaBeatsNotYetDue(t *testing.T) {
+	// A job that can never publish must be rejected now, not held until its
+	// RunAt and only then reported as poison.
+	c, _ := newPubsubCourier(t,
+		map[string]string{"high": "topic_high"},
+		[]string{"topic_high"},
+	)
+
+	jobs := []Job{{
+		CorrelationID:    "1",
+		ID:               "a",
+		Queue:            "high",
+		Payload:          []byte("x"),
+		RunAt:            time.Now().Add(time.Hour),
+		InternalJackMeta: []byte{0xff, 0xff, 0xff, 0xff},
+	}}
+
+	results, err := c.submit(t.Context(), jobs)
+	if err != nil {
+		t.Fatalf("submit: %v", err)
+	}
+	if results[0].Reason != ReasonValidationError {
+		t.Errorf("bad-meta future job: Reason=%q, want validation_error", results[0].Reason)
 	}
 }
 
@@ -453,8 +569,11 @@ func TestSubmit_EmitsMetrics(t *testing.T) {
 	if got := rec.incrTags("jack.courier.submit.count"); !hasTag(got, "status:success") || !hasTag(got, "queue:high") {
 		t.Errorf("submit.count tags = %v, want status:success and queue:high", got)
 	}
-	if got := rec.countValue("jack.courier.submit.jobs", "status:success"); got != 3 {
-		t.Errorf("submit.jobs success = %d, want 3", got)
+	if got := rec.countValue("jack.courier.submit.jobs", "status:success"); got != 1 {
+		t.Errorf("submit.jobs success = %d, want 1 (the two future jobs are deferred, not published)", got)
+	}
+	if got := rec.countValue("jack.courier.submit.jobs", "status:not_yet_due"); got != 2 {
+		t.Errorf("submit.jobs not_yet_due = %d, want 2", got)
 	}
 	if got := rec.distributionValue("jack.courier.submit.batch_size"); got != 3 {
 		t.Errorf("submit.batch_size = %v, want 3", got)

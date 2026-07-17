@@ -41,6 +41,9 @@ func TestIntegration_SubmitRoundTrip(t *testing.T) {
 	cases := []struct {
 		job        Job
 		wantShadow string
+		// wantReason, when set, means the courier must hand this job back with
+		// that Reason and never put it on the topic.
+		wantReason string
 	}{
 		{
 			job: Job{
@@ -68,6 +71,20 @@ func TestIntegration_SubmitRoundTrip(t *testing.T) {
 			},
 			wantShadow: "true",
 		},
+		{
+			job: Job{
+				CorrelationID:    "outbox-3",
+				ID:               "psjob_future",
+				Queue:            "high",
+				ProducerID:       "svc_courier_test",
+				JobType:          "test.round_trip",
+				Payload:          []byte(`{"hello":"future fousekis"}`),
+				TraceID:          "trace_future",
+				InternalJackMeta: metaBytes(t, false),
+				RunAt:            time.Now().Add(time.Hour),
+			},
+			wantReason: ReasonNotYetDue,
+		},
 	}
 
 	jobs := make([]Job, len(cases))
@@ -77,15 +94,28 @@ func TestIntegration_SubmitRoundTrip(t *testing.T) {
 
 	results, err := c.submit(t.Context(), jobs)
 	require.NoError(t, err, "submit")
-	for i, r := range results {
-		require.Emptyf(t, r.Err, "job %d (%s) failed to publish", i, r.JobID)
+	require.Len(t, results, len(cases), "one result per job")
+
+	wantPublished := 0
+	for i, tc := range cases {
+		if tc.wantReason == "" {
+			require.Emptyf(t, results[i].Err, "job %d (%s) failed to publish", i, results[i].JobID)
+			wantPublished++
+			continue
+		}
+		assert.Equalf(t, tc.wantReason, results[i].Reason, "job %d (%s) reason", i, results[i].JobID)
+		assert.NotEmptyf(t, results[i].Err, "job %d (%s) needs an error message alongside its reason", i, results[i].JobID)
 	}
 
-	got := receiveN(t, admin, subID, len(jobs))
+	got := receiveN(t, admin, subID, wantPublished)
 
 	for _, tc := range cases {
 		t.Run(tc.job.ID, func(t *testing.T) {
 			msg, ok := got[tc.job.ID]
+			if tc.wantReason != "" {
+				require.Falsef(t, ok, "job %s was held as %s and must not reach the topic", tc.job.ID, tc.wantReason)
+				return
+			}
 			require.Truef(t, ok, "no message received for job %s", tc.job.ID)
 
 			assert.Equal(t, tc.job.Payload, msg.Data, "payload")

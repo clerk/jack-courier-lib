@@ -55,12 +55,19 @@ type SubmitResult struct {
 	// JobID is echoed from the submitted Job.ID.
 	JobID string
 
-	// Err is non-empty if this job failed to publish.
+	// Err is non-empty if this job was not published.
 	Err string
 
-	// Reason is the rejection class, set only for failures that can never
-	// succeed: "payload_too_large", "validation_error". Empty means the
-	// failure is retryable.
+	// Reason classifies why, and is empty when Err is empty. It takes one of
+	// three classes, and the driver must handle each differently:
+	//
+	//   - Empty, with Err set: the publish failed but could succeed later
+	//     (e.g. a transport error). Retry the job.
+	//   - ReasonPayloadTooLarge, ReasonValidationError: the job can never be
+	//     published as-is. Dead-letter it; retrying only repeats the failure.
+	//   - ReasonNotYetDue: the job is scheduled too far ahead to publish yet.
+	//     It was never sent and nothing is wrong with it: keep it and submit
+	//     it again once Job.RunAt is near. It is not a delivery failure
 	Reason string
 }
 
@@ -72,7 +79,9 @@ type SubmitResult struct {
 // retry the batch with backoff.
 //
 // On partial failure, results contains a mix of successful and failed entries.
-// Each result has a `CorrelationID` echoed from the submitted job.
+// Each result has a `CorrelationID` echoed from the submitted job. Jobs
+// scheduled more than a minute ahead are not published and come back as
+// ReasonNotYetDue; see SubmitResult.Reason for how to handle each class.
 type SubmitFunc func(ctx context.Context, jobs []Job) ([]SubmitResult, error)
 
 // Driver sources jobs for publishing. The courier calls Driver.Run, passing
@@ -83,7 +92,7 @@ type SubmitFunc func(ctx context.Context, jobs []Job) ([]SubmitResult, error)
 // - Populates all required Job fields
 // - Batches per queue where possible: call-level metrics take the first job's queue (per-job metrics attribute by each job's own queue)
 // - Handles batch errors from `submit` (e.g. retry with backoff)
-// - Handles per-job failures in `SubmitResult.Err` (retry, dead-letter, or log)
+// - Handles per-job failures in `SubmitResult.Err` by their `Reason` (retry, dead-letter, or re-submit when due)
 // - Tracks delivery state so jobs are not re-submitted after success (e.g., advance WAL LSN, delete outbox rows, update cursor)
 // - Batches efficiently — larger batches amortize per-call overhead; smaller batches reduce latency
 // - Implements backpressure — if publishing is slow or erroring, the driver should back off rather than flood

@@ -15,10 +15,20 @@ import (
 	"google.golang.org/protobuf/proto"
 )
 
+// Reason values reported on SubmitResult.Reason. They are exported so drivers
+// can branch on the rejection class instead of matching the error text.
 const (
-	reasonValidationError = "validation_error"
-	reasonPayloadTooLarge = "payload_too_large"
+	ReasonValidationError = "validation_error"
+	ReasonPayloadTooLarge = "payload_too_large"
+	ReasonNotYetDue       = "not_yet_due"
 )
+
+// futureJobLeeway is how far ahead of now a job may be scheduled and still be
+// published immediately. Jobs due further out are held: nothing delays a
+// published message yet (see PLAT-3376), so publishing them would run them
+// early. A minute of leeway keeps jobs that are due imminently on the fast
+// path rather than bouncing them back to the driver for one more round trip.
+const futureJobLeeway = time.Minute
 
 // queuePublisher owns the Pub/Sub client for a single queue. Each queue gets
 // its own client — not just its own publisher handle — so one queue's
@@ -146,6 +156,7 @@ func (c *courier) submit(ctx context.Context, jobs []Job) ([]SubmitResult, error
 	queueTag := "queue:" + jobs[0].Queue
 
 	start := time.Now()
+	notDueAfter := start.Add(futureJobLeeway)
 	results := make([]SubmitResult, len(jobs))
 	futures := make([]*pubsub.PublishResult, len(jobs))
 	for i, job := range jobs {
@@ -154,7 +165,18 @@ func (c *courier) submit(ctx context.Context, jobs []Job) ([]SubmitResult, error
 		shadow, err := shadowFromMeta(job.InternalJackMeta)
 		if err != nil {
 			results[i].Err = fmt.Sprintf("decode internal_jack_meta: %v", err)
-			results[i].Reason = reasonValidationError
+			results[i].Reason = ReasonValidationError
+			continue
+		}
+
+		// Hand a job scheduled beyond the leeway back to the driver rather
+		// than publishing it early. It was never sent, so it is neither a
+		// delivery failure nor delivered: the driver keeps it and submits it
+		// again once it is due. Validation runs first, so a job that can
+		// never publish is rejected now rather than after its RunAt.
+		if job.RunAt.After(notDueAfter) {
+			results[i].Err = fmt.Sprintf("not due until %s", job.RunAt.UTC().Format(time.RFC3339))
+			results[i].Reason = ReasonNotYetDue
 			continue
 		}
 
@@ -173,20 +195,20 @@ func (c *courier) submit(ctx context.Context, jobs []Job) ([]SubmitResult, error
 			attrs["producer_id"] = job.ProducerID
 		}
 
-		// Publishing future jobs immediately is intentional for now.
-		// TODO(PLAT-3376): add delayed delivery support.
 		futures[i] = c.publishers[job.Queue].pub.Publish(ctx, &pubsub.Message{
 			Data:       job.Payload,
 			Attributes: attrs,
 		})
 	}
 
-	var failed, permanent int
+	// retryable counts failures that a batch retry could fix; the rest —
+	// deferrals and permanent rejections — carry a Reason and must resolve
+	// per job.
+	var failed, retryable int
 	var firstPubErr error
 	for i, f := range futures {
-		if f == nil { // rejected before publish
+		if f == nil { // deferred or rejected before publish
 			failed++
-			permanent++
 			continue
 		}
 		if _, err := f.Get(ctx); err != nil {
@@ -196,19 +218,20 @@ func (c *courier) submit(ctx context.Context, jobs []Job) ([]SubmitResult, error
 			results[i].Err = err.Error()
 			results[i].Reason = classifyPublishError(err)
 			failed++
-			if results[i].Reason != "" {
-				permanent++
+			if results[i].Reason == "" {
+				retryable++
 			}
 		}
 	}
 
 	// A batch where every job failed retryably is a transport-level problem:
 	// surface it as a call error so the driver retries the whole batch with
-	// backoff instead of dead-lettering everything. Any permanent failure
-	// must resolve per-job, or a poison job would make its batch retry
-	// forever. Wrapping the publish error keeps its identity so shutdown
-	// cancellation is not mistaken for a driver failure.
-	if failed == len(jobs) && permanent == 0 {
+	// backoff instead of dead-lettering everything. Anything carrying a Reason
+	// must resolve per-job: a poison job would make its batch retry forever,
+	// and a batch error would hide a deferral behind a transport failure.
+	// Wrapping the publish error keeps its identity so shutdown cancellation
+	// is not mistaken for a driver failure.
+	if failed == len(jobs) && retryable == failed {
 		_ = c.statsd.Incr("jack.courier.submit.count", []string{"status:error", queueTag}, 1)
 		return nil, fmt.Errorf("courier: publish batch: all %d jobs failed: %w", len(jobs), firstPubErr)
 	}
@@ -220,21 +243,22 @@ func (c *courier) submit(ctx context.Context, jobs []Job) ([]SubmitResult, error
 	_ = c.statsd.Distribution("jack.courier.submit.batch_size", float64(len(jobs)), []string{queueTag}, 1)
 
 	// Per-job metrics attribute by each job's own queue so a mixed batch
-	// cannot hide which queue is failing.
-	perQueueOK := make(map[string]int64)
-	perQueueFailed := make(map[string]int64)
+	// cannot hide which queue is failing. Deferrals get their own status:
+	// nothing went wrong, and counting them as errors would put every future
+	// job on the error rate.
+	perQueueStatus := make(map[[2]string]int64)
 	for i := range jobs {
-		if results[i].Err == "" {
-			perQueueOK[jobs[i].Queue]++
-		} else {
-			perQueueFailed[jobs[i].Queue]++
+		status := "success"
+		switch {
+		case results[i].Reason == ReasonNotYetDue:
+			status = ReasonNotYetDue
+		case results[i].Err != "":
+			status = "error"
 		}
+		perQueueStatus[[2]string{jobs[i].Queue, status}]++
 	}
-	for q, n := range perQueueOK {
-		_ = c.statsd.Count("jack.courier.submit.jobs", n, []string{"status:success", "queue:" + q}, 1)
-	}
-	for q, n := range perQueueFailed {
-		_ = c.statsd.Count("jack.courier.submit.jobs", n, []string{"status:error", "queue:" + q}, 1)
+	for k, n := range perQueueStatus {
+		_ = c.statsd.Count("jack.courier.submit.jobs", n, []string{"status:" + k[1], "queue:" + k[0]}, 1)
 	}
 
 	c.countFutureJobs(jobs, results)
@@ -242,17 +266,21 @@ func (c *courier) submit(ctx context.Context, jobs []Job) ([]SubmitResult, error
 	return results, nil
 }
 
-// countFutureJobs measures how many published jobs are scheduled in the
-// future. The courier publishes them like everything else (nothing delays
-// them yet; see PLAT-3376); the metric exists so we know the volume per
-// job type before routing types that schedule ahead. Failed jobs are
-// excluded so rejections and their retries do not inflate the volume.
+// countFutureJobs measures how many submitted jobs are scheduled in the
+// future, whether they were published (due within futureJobLeeway) or handed
+// back to the driver as not yet due. The metric exists so we know the volume
+// per job type before routing types that schedule ahead; see PLAT-3376.
+// Failed jobs are excluded so rejections and their retries do not inflate the
+// volume — a deferral is not a failure and still counts.
 func (c *courier) countFutureJobs(jobs []Job, results []SubmitResult) {
 	now := time.Now()
 	type group struct{ queue, jobType string }
 	perType := make(map[group]int64)
 	for i := range jobs {
-		if results[i].Err == "" && jobs[i].RunAt.After(now) {
+		if results[i].Err != "" && results[i].Reason != ReasonNotYetDue {
+			continue
+		}
+		if jobs[i].RunAt.After(now) {
 			perType[group{jobs[i].Queue, jobs[i].JobType}]++
 		}
 	}
@@ -285,7 +313,7 @@ func shadowFromMeta(b []byte) (bool, error) {
 // otherwise permanently dead-letter valid committed jobs.
 func classifyPublishError(err error) string {
 	if errors.Is(err, pubsub.ErrOversizedMessage) {
-		return reasonPayloadTooLarge
+		return ReasonPayloadTooLarge
 	}
 	return ""
 }
