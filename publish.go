@@ -106,9 +106,9 @@ func (c *courier) submit(ctx context.Context, jobs []Job) ([]SubmitResult, error
 
 	// Refuse a dead context before enqueueing anything: the client publishes
 	// bundles on a background context, so messages accepted here could still
-	// reach the wire while the driver retries the batch. Wrapping keeps the
-	// error identity for the shutdown path (errors.Is(context.Canceled)).
-	if err := ctx.Err(); err != nil {
+	// reach the wire while the driver retries the batch.
+	err := ctx.Err()
+	if err != nil {
 		return nil, fmt.Errorf("courier: submit: %w", err)
 	}
 
@@ -173,6 +173,8 @@ func (c *courier) submit(ctx context.Context, jobs []Job) ([]SubmitResult, error
 			attrs["producer_id"] = job.ProducerID
 		}
 
+		// Publishing future jobs immediately is intentional for now.
+		// TODO(PLAT-3376): add delayed delivery support.
 		futures[i] = c.publishers[job.Queue].pub.Publish(ctx, &pubsub.Message{
 			Data:       job.Payload,
 			Attributes: attrs,
