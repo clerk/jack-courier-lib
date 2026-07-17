@@ -34,7 +34,7 @@ type queuePublisher struct {
 // a topic name that can never publish.
 func parseTopicMap(raw string) (map[string]string, error) {
 	topics := make(map[string]string)
-	for _, pair := range strings.Split(raw, ",") {
+	for pair := range strings.SplitSeq(raw, ",") {
 		queue, topic, ok := strings.Cut(pair, ":")
 		queue, topic = strings.TrimSpace(queue), strings.TrimSpace(topic)
 		if !ok || queue == "" || topic == "" {
@@ -127,10 +127,10 @@ func (c *courier) submit(ctx context.Context, jobs []Job) ([]SubmitResult, error
 	// An unmapped queue is a config error. Reject the batch before publishing
 	// anything: half-publishing would turn the driver's retry of the batch
 	// into duplicates.
-	for i := range jobs {
-		if _, ok := c.publishers[jobs[i].Queue]; !ok {
-			_ = c.statsd.Incr("jack.courier.submit.count", []string{"status:error", "queue:" + jobs[i].Queue}, 1)
-			return nil, fmt.Errorf("courier: no topic configured for queue %q", jobs[i].Queue)
+	for _, job := range jobs {
+		if _, ok := c.publishers[job.Queue]; !ok {
+			_ = c.statsd.Incr("jack.courier.submit.count", []string{"status:error", "queue:" + job.Queue}, 1)
+			return nil, fmt.Errorf("courier: no topic configured for queue %q", job.Queue)
 		}
 	}
 
@@ -148,11 +148,10 @@ func (c *courier) submit(ctx context.Context, jobs []Job) ([]SubmitResult, error
 	start := time.Now()
 	results := make([]SubmitResult, len(jobs))
 	futures := make([]*pubsub.PublishResult, len(jobs))
-	for i := range jobs {
-		j := &jobs[i]
-		results[i] = SubmitResult{CorrelationID: j.CorrelationID, JobID: j.ID}
+	for i, job := range jobs {
+		results[i] = SubmitResult{CorrelationID: job.CorrelationID, JobID: job.ID}
 
-		shadow, err := shadowFromMeta(j.InternalJackMeta)
+		shadow, err := shadowFromMeta(job.InternalJackMeta)
 		if err != nil {
 			results[i].Err = fmt.Sprintf("decode internal_jack_meta: %v", err)
 			results[i].Reason = reasonValidationError
@@ -164,18 +163,18 @@ func (c *courier) submit(ctx context.Context, jobs []Job) ([]SubmitResult, error
 		// omitted rather than published: workers key dedup on the attribute,
 		// and a present-but-empty job_id would collide distinct jobs.
 		attrs := map[string]string{"shadow": strconv.FormatBool(shadow)}
-		if j.ID != "" {
-			attrs["job_id"] = j.ID
+		if job.ID != "" {
+			attrs["job_id"] = job.ID
 		}
-		if j.TraceID != "" {
-			attrs["trace_id"] = j.TraceID
+		if job.TraceID != "" {
+			attrs["trace_id"] = job.TraceID
 		}
-		if j.ProducerID != "" {
-			attrs["producer_id"] = j.ProducerID
+		if job.ProducerID != "" {
+			attrs["producer_id"] = job.ProducerID
 		}
 
-		futures[i] = c.publishers[j.Queue].pub.Publish(ctx, &pubsub.Message{
-			Data:       j.Payload,
+		futures[i] = c.publishers[job.Queue].pub.Publish(ctx, &pubsub.Message{
+			Data:       job.Payload,
 			Attributes: attrs,
 		})
 	}
