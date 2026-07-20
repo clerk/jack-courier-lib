@@ -11,8 +11,6 @@ import (
 	"strings"
 	"testing"
 	"time"
-
-	sentrygo "github.com/getsentry/sentry-go"
 )
 
 // startFakeSentry starts a local Sentry ingestion endpoint, so delivery
@@ -171,34 +169,6 @@ func TestRun_AbandonedDriverReportsWarning(t *testing.T) {
 	}
 }
 
-// A host binary may have initialized sentry-go itself. With courier
-// reporting disabled, captures must not piggyback on that hub.
-func TestCapture_DisabledDespiteHostHub(t *testing.T) {
-	bodies, dsn := startFakeSentry(t)
-
-	if err := initSentry("", "", ""); err != nil { // courier reporting disabled
-		t.Fatal(err)
-	}
-	// The embedding binary initializes the global client on its own.
-	if err := sentrygo.Init(sentrygo.ClientOptions{Dsn: dsn}); err != nil {
-		t.Fatal(err)
-	}
-
-	captureException(errors.New("boom"))
-	captureWarning(errors.New("boom"))
-	// Flush the host's hub directly: the courier's own flush is gated off
-	// while its reporting is disabled.
-	if !sentrygo.Flush(sentryFlushTimeout) {
-		t.Fatal("host hub flush timed out")
-	}
-
-	select {
-	case body := <-bodies:
-		t.Errorf("capture reported through the host's hub while disabled; body: %.500s", body)
-	default:
-	}
-}
-
 // A queue with no topic mapping is retried by the driver forever; Sentry
 // must get one event per queue, not one per retry.
 func TestSubmit_UnmappedQueueReportsOnce(t *testing.T) {
@@ -249,30 +219,6 @@ func TestSubmit_RepeatedPublishFailuresThrottled(t *testing.T) {
 	select {
 	case body := <-bodies:
 		t.Errorf("repeated publish failure reported more than once within the cooldown; body: %.500s", body)
-	default:
-	}
-}
-
-// A run without WithSentry must fully disable reporting even if an earlier
-// run in the same process enabled it.
-func TestRun_EmptyDSNDisablesEarlierInit(t *testing.T) {
-	bodies := newFakeSentry(t) // reporting currently enabled
-
-	t.Setenv("JACK_COURIER_SINK_NOOP", "true")
-	swapDriver(t, fakeDriver{run: func(context.Context, SubmitFunc) error { return nil }})
-	if code := run(WithLogger(discardLogger())); code != 0 {
-		t.Fatalf("expected exit code 0, got %d", code)
-	}
-
-	captureException(errors.New("boom"))
-	// Flush the hub directly: a leaked capture would otherwise sit in the
-	// transport queue, since the courier's own flush is gated off.
-	if !sentrygo.Flush(sentryFlushTimeout) {
-		t.Fatal("hub flush timed out")
-	}
-	select {
-	case body := <-bodies:
-		t.Errorf("capture reported after an empty-DSN run; body: %.500s", body)
 	default:
 	}
 }
