@@ -33,6 +33,18 @@ func WithStatsd(sd statsd.ClientInterface) Option {
 	}
 }
 
+// WithSentry configures Sentry error reporting.
+//
+// An empty DSN disables reporting, so the option can be passed unconditionally.
+func WithSentry(dsn, environment, release string) Option {
+	return func(c *courier) error {
+		c.sentryDSN = dsn
+		c.sentryEnvironment = environment
+		c.sentryRelease = release
+		return nil
+	}
+}
+
 // WithShutdownTimeout sets the maximum time allowed for graceful shutdown
 // after a termination signal is received. Defaults to 10 seconds.
 func WithShutdownTimeout(d time.Duration) Option {

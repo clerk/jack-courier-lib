@@ -53,6 +53,10 @@ Optional:
 - `JACK_COURIER_SINK_NOOP` — if `true` or `1`, the courier never publishes to Pub/Sub: submitted jobs are acknowledged as accepted and dropped, and the `JACK_COURIER_PUBSUB_*` variables are not required. Used to validate drivers end-to-end in production (partitioning, batching, cursor advancement) before the real sink is in place.
 - `PUBSUB_EMULATOR_HOST` — standard Pub/Sub emulator override for local development.
 
+## Error reporting
+
+Courier errors are logged and counted in Datadog metrics. With `WithSentry(dsn, environment, release)` they are also reported to Sentry, where they can be grouped and alerted on: publish failures, publisher startup failures, fatal driver errors, and degraded shutdowns (as warnings). Invalid env configuration fails startup on stderr before reporting is initialized. An empty DSN disables reporting entirely (the SDK's `SENTRY_*` env fallbacks are not consulted), so the option can be passed unconditionally. Submit failures are reported at most once per queue per minute, since drivers retry failing batches on a tight loop; logs and metrics reflect every occurrence. Shutdown cancellation is never reported, and the final flush shares the shutdown timeout budget.
+
 ## Error semantics
 
 `submit` returns per-job results. A failure is permanent (`Reason` set to `payload_too_large` or `validation_error`) only when retrying can never succeed; drivers should dead-letter those. All other failures are retryable: the driver retries them on its own schedule. When every job in a batch fails retryably (e.g. a transport outage), `submit` returns a single batch error instead, so drivers retry the whole batch with backoff.

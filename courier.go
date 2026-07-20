@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/signal"
 	"strconv"
+	"sync"
 	"syscall"
 	"time"
 
@@ -30,6 +31,13 @@ type courier struct {
 	sinkNoop        bool
 	logger          *slog.Logger
 	statsd          statsd.ClientInterface
+
+	sentryDSN         string
+	sentryEnvironment string
+	sentryRelease     string
+	// sentryLastReport holds the last time a submit failure was reported to
+	// Sentry per queue, since drivers retry failing batches on a tight loop.
+	sentryLastReport sync.Map
 
 	publishers map[string]*queuePublisher
 }
@@ -123,6 +131,16 @@ func run(opts ...Option) int {
 
 	defer func() { _ = c.statsd.Flush() }()
 
+	// Reporting stays off unless a DSN was explicitly configured: skipping
+	// Init keeps the SDK's SENTRY_* env fallbacks and the global hub
+	// untouched.
+	if c.sentryDSN != "" {
+		if err := initSentry(c.sentryDSN, c.sentryEnvironment, c.sentryRelease); err != nil {
+			fmt.Fprintf(os.Stderr, "courier: sentry: %v\n", err)
+			return 1
+		}
+	}
+
 	if v := os.Getenv("JACK_COURIER_SHUTDOWN_TIMEOUT"); v != "" {
 		d, err := parsePositiveDuration("JACK_COURIER_SHUTDOWN_TIMEOUT", v)
 		if err != nil {
@@ -145,6 +163,8 @@ func run(opts ...Option) int {
 		c.logger.Info("JACK_COURIER_SINK_NOOP enabled: jobs will be acknowledged without being published to Pub/Sub")
 	} else if err := c.buildPublishers(context.Background(), topics); err != nil {
 		c.logger.Error("failed to create pubsub publishers", slog.String("error", err.Error()))
+		captureException(err)
+		flushSentry(sentryFlushTimeout)
 		return 1
 	}
 
@@ -172,6 +192,7 @@ func run(opts ...Option) int {
 		c.logger.Info("health server started", slog.String("addr", server.Addr))
 		if err := server.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			c.logger.Error("health server error", slog.String("error", err.Error()))
+			captureException(err)
 		}
 	}()
 
@@ -203,6 +224,13 @@ func (c *courier) run(ctx context.Context, server *http.Server) int {
 	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), c.shutdownTimeout)
 	defer shutdownCancel()
 
+	// The final Sentry flush also shares the shutdown budget, so a slow
+	// transport cannot push termination past the documented bound.
+	defer func() {
+		deadline, _ := shutdownCtx.Deadline()
+		flushSentry(min(sentryFlushTimeout, time.Until(deadline)))
+	}()
+
 	// The publisher flush shares the shutdown budget with the driver drain,
 	// so the shutdown timeout bounds total termination time as documented.
 	defer c.stopPublishers(shutdownCtx)
@@ -214,16 +242,19 @@ func (c *courier) run(ctx context.Context, server *http.Server) int {
 			// Driver did not exit in time; exit now and let process teardown close the server.
 			c.logger.Warn("driver did not exit within shutdown timeout, abandoning",
 				slog.Duration("timeout", c.shutdownTimeout))
+			captureWarning(fmt.Errorf("courier: driver did not exit within shutdown timeout (%s), abandoned", c.shutdownTimeout))
 			return 1
 		}
 	}
 
 	if shutdownErr := server.Shutdown(shutdownCtx); shutdownErr != nil {
 		c.logger.Error("health server shutdown error", slog.String("error", shutdownErr.Error()))
+		captureException(shutdownErr)
 	}
 
 	if err != nil && !errors.Is(err, context.Canceled) {
 		c.logger.Error("driver exited with error", slog.String("error", err.Error()))
+		captureException(err)
 		return 1
 	}
 
