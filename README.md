@@ -55,7 +55,7 @@ Optional:
 
 ## Error reporting
 
-Courier errors are logged and counted in Datadog metrics. With `WithSentry(dsn, environment, release)` they are also reported to Sentry, where they can be grouped and alerted on: publish failures, publisher startup failures, fatal driver errors, and degraded shutdowns (as warnings). Invalid env configuration fails startup on stderr before reporting is initialized. An empty DSN disables reporting entirely (the SDK's `SENTRY_*` env fallbacks are not consulted), so the option can be passed unconditionally. Submit failures are reported at most once per queue per minute, since drivers retry failing batches on a tight loop; logs and metrics reflect every occurrence. Shutdown cancellation is never reported, and the final flush shares the shutdown timeout budget.
+Courier errors are logged and counted in Datadog metrics. With `WithSentry(dsn, environment, release)` they are also reported to Sentry, where they can be grouped and alerted on: publish failures, publisher startup failures, fatal driver errors, and degraded shutdowns (as warnings). Env configuration read before the options are applied (the sink-noop flag, project and topics) fails startup on stderr only; config errors after that point are reported. An empty DSN disables reporting entirely (the SDK's `SENTRY_*` env fallbacks are not consulted), so the option can be passed unconditionally. Submit failures are reported at most once per queue per minute, since drivers retry failing batches on a tight loop; logs and metrics reflect every occurrence. Shutdown cancellation is never reported, and the final flush shares the shutdown timeout budget.
 
 ## Error semantics
 

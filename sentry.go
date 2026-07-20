@@ -32,7 +32,7 @@ func captureException(err error) {
 }
 
 func captureWarning(err error) {
-	if !sentryEnabled.Load() {
+	if !sentryEnabled.Load() || errors.Is(err, context.Canceled) {
 		return
 	}
 	// The hub is cloned so the level cannot leak into captures on other
@@ -45,9 +45,12 @@ func captureWarning(err error) {
 const sentryFlushTimeout = 2 * time.Second
 
 // flushSentry waits up to limit for buffered events to reach Sentry, since
-// events are delivered asynchronously.
-func flushSentry(limit time.Duration) {
-	if limit > 0 {
-		sentrygo.Flush(limit)
+// events are delivered asynchronously, reporting whether the queue fully
+// drained. It does nothing when courier reporting is disabled, so a hub
+// initialized by the embedding binary is never flushed.
+func flushSentry(limit time.Duration) bool {
+	if !sentryEnabled.Load() || limit <= 0 {
+		return false
 	}
+	return sentrygo.Flush(limit)
 }

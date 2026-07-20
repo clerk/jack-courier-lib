@@ -145,6 +145,8 @@ func run(opts ...Option) int {
 		d, err := parsePositiveDuration("JACK_COURIER_SHUTDOWN_TIMEOUT", v)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "courier: %v\n", err)
+			captureException(err)
+			flushSentry(sentryFlushTimeout)
 			return 1
 		}
 		c.shutdownTimeout = d
@@ -154,6 +156,8 @@ func run(opts ...Option) int {
 		d, err := parsePositiveDuration("JACK_COURIER_SUBMIT_TIMEOUT", v)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "courier: %v\n", err)
+			captureException(err)
+			flushSentry(sentryFlushTimeout)
 			return 1
 		}
 		c.submitTimeout = d

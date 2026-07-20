@@ -186,7 +186,11 @@ func TestCapture_DisabledDespiteHostHub(t *testing.T) {
 
 	captureException(errors.New("boom"))
 	captureWarning(errors.New("boom"))
-	flushSentry(sentryFlushTimeout)
+	// Flush the host's hub directly: the courier's own flush is gated off
+	// while its reporting is disabled.
+	if !sentrygo.Flush(sentryFlushTimeout) {
+		t.Fatal("host hub flush timed out")
+	}
 
 	select {
 	case body := <-bodies:
@@ -206,7 +210,9 @@ func TestSubmit_UnmappedQueueReportsOnce(t *testing.T) {
 			t.Fatal("expected error for unmapped queue")
 		}
 	}
-	flushSentry(sentryFlushTimeout)
+	if !flushSentry(sentryFlushTimeout) {
+		t.Fatal("sentry flush timed out")
+	}
 
 	if body := awaitEvent(t, bodies); !strings.Contains(body, "no topic configured") {
 		t.Errorf("delivered event does not mention the unmapped queue; body: %.500s", body)
@@ -233,7 +239,9 @@ func TestSubmit_RepeatedPublishFailuresThrottled(t *testing.T) {
 			t.Fatal("expected batch error from stalled publishes")
 		}
 	}
-	flushSentry(sentryFlushTimeout)
+	if !flushSentry(sentryFlushTimeout) {
+		t.Fatal("sentry flush timed out")
+	}
 
 	if body := awaitEvent(t, bodies); !strings.Contains(body, "publish batch") {
 		t.Errorf("delivered event does not mention the publish batch failure; body: %.500s", body)
@@ -246,16 +254,35 @@ func TestSubmit_RepeatedPublishFailuresThrottled(t *testing.T) {
 }
 
 // Shutdown cancellation is the expected path out of submit and the driver;
-// it must never turn into a Sentry event.
-func TestCaptureException_SkipsContextCanceled(t *testing.T) {
+// it must never turn into a Sentry event, at either level.
+func TestCapture_SkipsContextCanceled(t *testing.T) {
 	bodies := newFakeSentry(t)
 
 	captureException(fmt.Errorf("courier: submit: %w", context.Canceled))
-	flushSentry(sentryFlushTimeout)
+	captureWarning(fmt.Errorf("courier: close: %w", context.Canceled))
+	if !flushSentry(sentryFlushTimeout) {
+		t.Fatal("sentry flush timed out")
+	}
 
 	select {
 	case body := <-bodies:
 		t.Errorf("context.Canceled was reported to Sentry; body: %.500s", body)
 	default:
+	}
+}
+
+// Timeout env vars are parsed after Sentry is initialized, so their config
+// errors are reported, unlike the config read before the options.
+func TestRun_TimeoutConfigErrorReportsToSentry(t *testing.T) {
+	bodies, dsn := startFakeSentry(t)
+	t.Setenv("JACK_COURIER_SINK_NOOP", "true")
+	t.Setenv("JACK_COURIER_SHUTDOWN_TIMEOUT", "nope")
+	swapDriver(t, fakeDriver{run: func(context.Context, SubmitFunc) error { return nil }})
+
+	if code := run(WithLogger(discardLogger()), WithSentry(dsn, "test", "")); code != 1 {
+		t.Fatalf("expected exit code 1, got %d", code)
+	}
+	if body := awaitEvent(t, bodies); !strings.Contains(body, "JACK_COURIER_SHUTDOWN_TIMEOUT") {
+		t.Errorf("delivered event does not mention the invalid timeout; body: %.500s", body)
 	}
 }
