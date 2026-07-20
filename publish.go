@@ -94,6 +94,7 @@ func (c *courier) stopPublishers(ctx context.Context) {
 				qp.pub.Stop()
 				if err := qp.client.Close(); err != nil {
 					c.logger.Warn("pubsub client close error", slog.String("error", err.Error()))
+					captureWarning(err)
 				}
 			})
 		}
@@ -103,6 +104,7 @@ func (c *courier) stopPublishers(ctx context.Context) {
 	case <-done:
 	case <-ctx.Done():
 		c.logger.Warn("publisher shutdown exceeded the shutdown timeout, abandoning flush")
+		captureWarning(errors.New("courier: publisher shutdown exceeded the shutdown timeout, abandoned flush"))
 	}
 }
 
@@ -140,7 +142,9 @@ func (c *courier) submit(ctx context.Context, jobs []Job) ([]SubmitResult, error
 	for _, job := range jobs {
 		if _, ok := c.publishers[job.Queue]; !ok {
 			_ = c.statsd.Incr("jack.courier.submit.count", []string{"status:error", "queue:" + job.Queue}, 1)
-			return nil, fmt.Errorf("courier: no topic configured for queue %q", job.Queue)
+			err := fmt.Errorf("courier: no topic configured for queue %q", job.Queue)
+			c.reportSubmitFailure(job.Queue, err)
+			return nil, err
 		}
 	}
 
@@ -203,8 +207,9 @@ func (c *courier) submit(ctx context.Context, jobs []Job) ([]SubmitResult, error
 
 	// retryable counts failures that a batch retry could fix; the rest —
 	// deferrals and permanent rejections — carry a Reason and must resolve
-	// per job.
-	var failed, retryable int
+	// per job. pubFailed counts only real publish failures, excluding jobs
+	// that never reached Pub/Sub (deferrals, validation rejections).
+	var failed, retryable, pubFailed int
 	var firstPubErr error
 	for i, f := range futures {
 		if f == nil { // deferred or rejected before publish
@@ -215,6 +220,7 @@ func (c *courier) submit(ctx context.Context, jobs []Job) ([]SubmitResult, error
 			if firstPubErr == nil {
 				firstPubErr = err
 			}
+			pubFailed++
 			results[i].Err = err.Error()
 			results[i].Reason = classifyPublishError(err)
 			failed++
@@ -233,7 +239,15 @@ func (c *courier) submit(ctx context.Context, jobs []Job) ([]SubmitResult, error
 	// is not mistaken for a driver failure.
 	if failed == len(jobs) && retryable == failed {
 		_ = c.statsd.Incr("jack.courier.submit.count", []string{"status:error", queueTag}, 1)
-		return nil, fmt.Errorf("courier: publish batch: all %d jobs failed: %w", len(jobs), firstPubErr)
+		err := fmt.Errorf("courier: publish batch: all %d jobs failed: %w", len(jobs), firstPubErr)
+		c.reportSubmitFailure(jobs[0].Queue, err)
+		return nil, err
+	}
+
+	// Publish failures that resolve per-job are reported too: the driver
+	// retries or dead-letters them without any error reporting of its own.
+	if firstPubErr != nil {
+		c.reportSubmitFailure(jobs[0].Queue, fmt.Errorf("courier: publish: %d of %d jobs failed: %w", pubFailed, len(jobs), firstPubErr))
 	}
 
 	// submit.count reflects the call outcome (resolved per-job vs failed as
@@ -302,6 +316,25 @@ func shadowFromMeta(b []byte) (bool, error) {
 		return false, err
 	}
 	return meta.GetShadow(), nil
+}
+
+// sentryReportCooldown bounds how often submit failures are reported to
+// Sentry per queue: drivers retry failing batches on a tight loop, and
+// unthrottled captures would burn the Sentry quota during a sustained
+// outage. Logs and metrics still reflect every occurrence.
+const sentryReportCooldown = time.Minute
+
+func (c *courier) reportSubmitFailure(queue string, err error) {
+	// Cancellation is never reported, so it must not consume the queue's
+	// report slot and suppress a later real failure.
+	if errors.Is(err, context.Canceled) {
+		return
+	}
+	if last, ok := c.sentryLastReport.Load(queue); ok && time.Since(last.(time.Time)) < sentryReportCooldown {
+		return
+	}
+	c.sentryLastReport.Store(queue, time.Now())
+	captureException(err)
 }
 
 // classifyPublishError maps a publish failure to a SubmitResult.Reason.
