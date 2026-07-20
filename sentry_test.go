@@ -253,6 +253,47 @@ func TestSubmit_RepeatedPublishFailuresThrottled(t *testing.T) {
 	}
 }
 
+// A run without WithSentry must fully disable reporting even if an earlier
+// run in the same process enabled it.
+func TestRun_EmptyDSNDisablesEarlierInit(t *testing.T) {
+	bodies := newFakeSentry(t) // reporting currently enabled
+
+	t.Setenv("JACK_COURIER_SINK_NOOP", "true")
+	swapDriver(t, fakeDriver{run: func(context.Context, SubmitFunc) error { return nil }})
+	if code := run(WithLogger(discardLogger())); code != 0 {
+		t.Fatalf("expected exit code 0, got %d", code)
+	}
+
+	captureException(errors.New("boom"))
+	// Flush the hub directly: a leaked capture would otherwise sit in the
+	// transport queue, since the courier's own flush is gated off.
+	if !sentrygo.Flush(sentryFlushTimeout) {
+		t.Fatal("hub flush timed out")
+	}
+	select {
+	case body := <-bodies:
+		t.Errorf("capture reported after an empty-DSN run; body: %.500s", body)
+	default:
+	}
+}
+
+// A canceled submit must not consume the queue's report slot and suppress
+// a later real failure.
+func TestReportSubmitFailure_CanceledDoesNotConsumeCooldown(t *testing.T) {
+	bodies := newFakeSentry(t)
+	c := &courier{}
+
+	c.reportSubmitFailure("high", fmt.Errorf("courier: submit: %w", context.Canceled))
+	c.reportSubmitFailure("high", errors.New("boom"))
+	if !flushSentry(sentryFlushTimeout) {
+		t.Fatal("sentry flush timed out")
+	}
+
+	if body := awaitEvent(t, bodies); !strings.Contains(body, "boom") {
+		t.Errorf("real failure was not reported; body: %.500s", body)
+	}
+}
+
 // Shutdown cancellation is the expected path out of submit and the driver;
 // it must never turn into a Sentry event, at either level.
 func TestCapture_SkipsContextCanceled(t *testing.T) {

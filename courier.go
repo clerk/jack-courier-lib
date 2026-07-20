@@ -139,6 +139,9 @@ func run(opts ...Option) int {
 			fmt.Fprintf(os.Stderr, "courier: sentry: %v\n", err)
 			return 1
 		}
+	} else {
+		// An earlier init in the same process must not leak into this run.
+		sentryEnabled.Store(false)
 	}
 
 	if v := os.Getenv("JACK_COURIER_SHUTDOWN_TIMEOUT"); v != "" {

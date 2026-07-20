@@ -325,6 +325,11 @@ func shadowFromMeta(b []byte) (bool, error) {
 const sentryReportCooldown = time.Minute
 
 func (c *courier) reportSubmitFailure(queue string, err error) {
+	// Cancellation is never reported, so it must not consume the queue's
+	// report slot and suppress a later real failure.
+	if errors.Is(err, context.Canceled) {
+		return
+	}
 	if last, ok := c.sentryLastReport.Load(queue); ok && time.Since(last.(time.Time)) < sentryReportCooldown {
 		return
 	}
