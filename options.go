@@ -41,8 +41,33 @@ func WithStatsd(sd statsd.ClientInterface) Option {
 func WithSentry(dsn, environment, release string) Option {
 	return func(c *courier) error {
 		c.sentryDSN = dsn
-		c.sentryEnvironment = environment
-		c.sentryRelease = release
+		if environment != "" {
+			c.env = environment
+		}
+		if release != "" {
+			c.serviceVersion = release
+		}
+		return nil
+	}
+}
+
+// WithDatadogTracing enables the Datadog APM tracer for the process, tagging
+// every span with the given service, environment and version. Each submit
+// call emits one span covering its Pub/Sub publishes.
+//
+// An empty service disables tracing, so the option can be passed
+// unconditionally. The courier owns the process's global tracer; nothing else
+// in the process should call tracer.Start. Agent connectivity comes from the
+// standard DD_* environment variables.
+func WithDatadogTracing(service, environment, version string) Option {
+	return func(c *courier) error {
+		c.traceService = service
+		if environment != "" {
+			c.env = environment
+		}
+		if version != "" {
+			c.serviceVersion = version
+		}
 		return nil
 	}
 }

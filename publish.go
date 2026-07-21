@@ -13,6 +13,8 @@ import (
 	"cloud.google.com/go/pubsub/v2"
 	"github.com/clerk/jack/proto/jackpb"
 	"google.golang.org/protobuf/proto"
+	"gopkg.in/DataDog/dd-trace-go.v1/ddtrace/ext"
+	"gopkg.in/DataDog/dd-trace-go.v1/ddtrace/tracer"
 )
 
 // Reason values reported on SubmitResult.Reason. They are exported so drivers
@@ -111,15 +113,42 @@ func (c *courier) stopPublishers(ctx context.Context) {
 // submit publishes a batch of jobs to their queues' Pub/Sub topics and maps
 // per-message outcomes onto SubmitResults. When sinkNoop is set, nothing is
 // published and every job is reported as accepted.
-func (c *courier) submit(ctx context.Context, jobs []Job) ([]SubmitResult, error) {
+func (c *courier) submit(ctx context.Context, jobs []Job) (results []SubmitResult, err error) {
 	if len(jobs) == 0 {
 		return nil, nil
 	}
 
+	span, ctx := tracer.StartSpanFromContext(ctx, "courier.submit",
+		tracer.ResourceName(jobs[0].Queue),
+		tracer.SpanType(ext.SpanTypeMessageProducer),
+		tracer.Tag(ext.SpanKind, ext.SpanKindProducer),
+		tracer.Tag(ext.MessagingSystem, ext.MessagingSystemGCPPubsub),
+		tracer.Tag("jobs.count", len(jobs)),
+	)
+	defer func() {
+		// The tag is only set when per-job outcomes exist; a batch-level
+		// failure has none, and the span error already covers it.
+		if results != nil {
+			var failed int
+			for _, r := range results {
+				if r.Err != "" && r.Reason != ReasonNotYetDue {
+					failed++
+				}
+			}
+			span.SetTag("jobs.failed", failed)
+		}
+		// Shutdown cancellation (e.g. deployments) is not an unexpected error
+		if errors.Is(err, context.Canceled) {
+			span.Finish()
+			return
+		}
+		span.Finish(tracer.WithError(err))
+	}()
+
 	// Refuse a dead context before enqueueing anything: the client publishes
 	// bundles on a background context, so messages accepted here could still
 	// reach the wire while the driver retries the batch.
-	err := ctx.Err()
+	err = ctx.Err()
 	if err != nil {
 		return nil, fmt.Errorf("courier: submit: %w", err)
 	}
@@ -127,7 +156,7 @@ func (c *courier) submit(ctx context.Context, jobs []Job) ([]SubmitResult, error
 	if c.sinkNoop {
 		// Acknowledge every job as accepted without publishing. Queues are
 		// not validated: noop mode runs without any topic configuration.
-		results := make([]SubmitResult, len(jobs))
+		results = make([]SubmitResult, len(jobs))
 		for i, j := range jobs {
 			results[i] = SubmitResult{CorrelationID: j.CorrelationID, JobID: j.ID}
 		}
@@ -161,7 +190,7 @@ func (c *courier) submit(ctx context.Context, jobs []Job) ([]SubmitResult, error
 
 	start := time.Now()
 	notDueAfter := start.Add(futureJobLeeway)
-	results := make([]SubmitResult, len(jobs))
+	results = make([]SubmitResult, len(jobs))
 	futures := make([]*pubsub.PublishResult, len(jobs))
 	for i, job := range jobs {
 		results[i] = SubmitResult{CorrelationID: job.CorrelationID, JobID: job.ID}

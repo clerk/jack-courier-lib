@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/DataDog/datadog-go/v5/statsd"
+	"gopkg.in/DataDog/dd-trace-go.v1/ddtrace/tracer"
 )
 
 const (
@@ -32,9 +33,15 @@ type courier struct {
 	logger          *slog.Logger
 	statsd          statsd.ClientInterface
 
-	sentryDSN         string
-	sentryEnvironment string
-	sentryRelease     string
+	// env and serviceVersion identify the deployment to both Datadog
+	// tracing and Sentry; for each, the last non-empty value passed
+	// through an option wins.
+	env            string
+	serviceVersion string
+
+	traceService string
+
+	sentryDSN string
 	// sentryLastReport holds the last time a submit failure was reported to
 	// Sentry per queue, since drivers retry failing batches on a tight loop.
 	sentryLastReport sync.Map
@@ -135,10 +142,25 @@ func run(opts ...Option) int {
 	// Init keeps the SDK's SENTRY_* env fallbacks and the global hub
 	// untouched.
 	if c.sentryDSN != "" {
-		if err := initSentry(c.sentryDSN, c.sentryEnvironment, c.sentryRelease); err != nil {
+		if err := initSentry(c.sentryDSN, c.env, c.serviceVersion); err != nil {
 			fmt.Fprintf(os.Stderr, "courier: sentry: %v\n", err)
 			return 1
 		}
+	}
+
+	// Tracing stays off unless a service was explicitly configured. Stop
+	// runs after the driver has shut down, flushing buffered spans before
+	// the process exits.
+	if c.traceService != "" {
+		traceOpts := []tracer.StartOption{tracer.WithService(c.traceService)}
+		if c.env != "" {
+			traceOpts = append(traceOpts, tracer.WithEnv(c.env))
+		}
+		if c.serviceVersion != "" {
+			traceOpts = append(traceOpts, tracer.WithServiceVersion(c.serviceVersion))
+		}
+		tracer.Start(traceOpts...)
+		defer tracer.Stop()
 	}
 
 	if v := os.Getenv("JACK_COURIER_SHUTDOWN_TIMEOUT"); v != "" {
