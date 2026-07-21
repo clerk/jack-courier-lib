@@ -57,6 +57,10 @@ Optional:
 
 Courier errors are logged and counted in Datadog metrics. With `WithSentry(dsn, environment, release)` they are also reported to Sentry, where they can be grouped and alerted on: publish failures, publisher startup failures, fatal driver errors, and degraded shutdowns (as warnings). Env configuration read before the options are applied (the sink-noop flag, project and topics) fails startup on stderr only; config errors after that point are reported. An empty DSN disables reporting entirely (the SDK's `SENTRY_*` env fallbacks are not consulted), so the option can be passed unconditionally. Submit failures are reported at most once per queue per minute, since drivers retry failing batches on a tight loop; logs and metrics reflect every occurrence. Shutdown cancellation is never reported, and the final flush shares the shutdown timeout budget.
 
+## Tracing
+
+With `WithDatadogTracing(service, environment, version)` the courier starts the Datadog APM tracer for the process and emits one `courier.submit` span per submit call, covering the enqueue and the wait for every publish to resolve. The span's resource is the queue, with `jobs.count`/`jobs.failed` tags; batch-level failures mark the span as an error, except shutdown cancellation, which would otherwise put every deploy on the APM error rate. An empty service disables tracing entirely, so the option can be passed unconditionally. The courier owns the process-global tracer; drivers that create their own spans (e.g. the polling driver's database queries) report through it. Agent connectivity comes from the standard `DD_*` environment variables.
+
 ## Error semantics
 
 `submit` returns per-job results. A failure is permanent (`Reason` set to `payload_too_large` or `validation_error`) only when retrying can never succeed; drivers should dead-letter those. All other failures are retryable: the driver retries them on its own schedule. When every job in a batch fails retryably (e.g. a transport outage), `submit` returns a single batch error instead, so drivers retry the whole batch with backoff.
