@@ -60,6 +60,28 @@ func TestSubmit_SpanTagsAndPerJobFailures(t *testing.T) {
 	}
 }
 
+func TestSubmit_SinkNoopSpanIsNotAProducer(t *testing.T) {
+	mt := mocktracer.Start()
+	defer mt.Stop()
+
+	c := &courier{sinkNoop: true, logger: discardLogger(), statsd: &statsd.NoOpClient{}}
+
+	if _, err := c.submit(t.Context(), []Job{{CorrelationID: "1", Queue: "high"}}); err != nil {
+		t.Fatalf("submit: %v", err)
+	}
+
+	span := submitSpan(t, mt)
+	if got := span.Tag(ext.SpanKind); got != nil {
+		t.Errorf("span.kind = %v, want unset", got)
+	}
+	if got := span.Tag(ext.MessagingSystem); got != nil {
+		t.Errorf("messaging.system = %v, want unset", got)
+	}
+	if got := span.Tag("sink.noop"); got != true {
+		t.Errorf("sink.noop = %v, want true", got)
+	}
+}
+
 func TestSubmit_SpanBatchErrorIsMarked(t *testing.T) {
 	mt := mocktracer.Start()
 	defer mt.Stop()
