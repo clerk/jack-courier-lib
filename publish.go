@@ -118,13 +118,20 @@ func (c *courier) submit(ctx context.Context, jobs []Job) (results []SubmitResul
 		return nil, nil
 	}
 
-	span, ctx := tracer.StartSpanFromContext(ctx, "courier.submit",
+	spanOptions := []tracer.StartSpanOption{
 		tracer.ResourceName(jobs[0].Queue),
-		tracer.SpanType(ext.SpanTypeMessageProducer),
-		tracer.Tag(ext.SpanKind, ext.SpanKindProducer),
-		tracer.Tag(ext.MessagingSystem, ext.MessagingSystemGCPPubsub),
 		tracer.Tag("jobs.count", len(jobs)),
-	)
+	}
+	if c.sinkNoop {
+		spanOptions = append(spanOptions, tracer.Tag("sink.noop", true))
+	} else {
+		spanOptions = append(spanOptions,
+			tracer.SpanType(ext.SpanTypeMessageProducer),
+			tracer.Tag(ext.SpanKind, ext.SpanKindProducer),
+			tracer.Tag(ext.MessagingSystem, ext.MessagingSystemGCPPubsub),
+		)
+	}
+	span, ctx := tracer.StartSpanFromContext(ctx, "courier.submit", spanOptions...)
 	defer func() {
 		// The tag is only set when per-job outcomes exist; a batch-level
 		// failure has none, and the span error already covers it.
