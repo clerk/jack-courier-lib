@@ -394,6 +394,8 @@ func TestSubmit_MissingTopicFailsBatchRetryably(t *testing.T) {
 		map[string]string{"high": "topic_missing"},
 		nil,
 	)
+	rec := &recordingStatsd{ClientInterface: &statsd.NoOpClient{}}
+	c.statsd = rec
 
 	jobs := []Job{
 		{CorrelationID: "1", ID: "a", Queue: "high", Payload: []byte("x")},
@@ -406,6 +408,9 @@ func TestSubmit_MissingTopicFailsBatchRetryably(t *testing.T) {
 	}
 	if n := len(srv.Messages()); n != 0 {
 		t.Errorf("expected nothing published, got %d messages", n)
+	}
+	if got := rec.incrTags("jack.courier.submit.count"); !hasTag(got, "status:error") || hasTag(got, "status:canceled") {
+		t.Errorf("submit.count tags = %v, want status:error without status:canceled", got)
 	}
 }
 
@@ -685,6 +690,18 @@ func newStalledCourier(t *testing.T) *courier {
 	return c
 }
 
+type blockingPublishReactor struct {
+	started chan struct{}
+	release chan struct{}
+	once    sync.Once
+}
+
+func (r *blockingPublishReactor) React(_ any) (bool, any, error) {
+	r.once.Do(func() { close(r.started) })
+	<-r.release
+	return true, &pubsubpb.PublishResponse{MessageIds: []string{"message-id"}}, nil
+}
+
 func TestStopPublishers_BoundedByContext(t *testing.T) {
 	// A pending publish makes Publisher.Stop block on flushing it far beyond
 	// any shutdown budget. stopPublishers must give up when its context
@@ -704,12 +721,76 @@ func TestStopPublishers_BoundedByContext(t *testing.T) {
 	}
 }
 
+func TestSubmit_CanceledPublishUsesCanceledStatus(t *testing.T) {
+	reactor := &blockingPublishReactor{
+		started: make(chan struct{}),
+		release: make(chan struct{}),
+	}
+	srv := pstest.NewServer(pstest.ServerReactorOption{
+		FuncName: "Publish",
+		Reactor:  reactor,
+	})
+	t.Cleanup(func() { _ = srv.Close() })
+	t.Setenv("PUBSUB_EMULATOR_HOST", srv.Addr)
+
+	client, err := pubsub.NewClient(t.Context(), "test-project")
+	if err != nil {
+		t.Fatalf("client: %v", err)
+	}
+	rec := &recordingStatsd{ClientInterface: &statsd.NoOpClient{}}
+	c := &courier{
+		logger:     discardLogger(),
+		statsd:     rec,
+		publishers: map[string]*queuePublisher{"high": {client: client, pub: client.Publisher("topic_high")}},
+	}
+	t.Cleanup(func() { c.stopPublishers(context.Background()) })
+
+	var releaseOnce sync.Once
+	releasePublish := func() {
+		releaseOnce.Do(func() { close(reactor.release) })
+	}
+	t.Cleanup(releasePublish)
+
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	errCh := make(chan error, 1)
+	go func() {
+		_, err := c.submit(ctx, []Job{
+			{CorrelationID: "1", ID: "a", Queue: "high", Payload: []byte("x")},
+		})
+		errCh <- err
+	}()
+
+	select {
+	case <-reactor.started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("publish RPC did not start")
+	}
+	cancel()
+
+	select {
+	case err = <-errCh:
+	case <-time.After(2 * time.Second):
+		t.Fatal("submit did not return after cancellation")
+	}
+	releasePublish()
+
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("err = %v, want it to wrap context.Canceled", err)
+	}
+	if got := rec.incrTags("jack.courier.submit.count"); !hasTag(got, "status:canceled") || hasTag(got, "status:error") {
+		t.Errorf("submit.count tags = %v, want status:canceled without status:error", got)
+	}
+}
+
 func TestSubmit_TimesOutOnStalledPublish(t *testing.T) {
 	// A stalled Pub/Sub must not hang submit past the configured submit
 	// timeout: every publish fails with the context error and the batch
 	// surfaces as a retryable batch error to the driver.
 	c := newStalledCourier(t)
 	c.submitTimeout = 100 * time.Millisecond
+	rec := &recordingStatsd{ClientInterface: &statsd.NoOpClient{}}
+	c.statsd = rec
 
 	start := time.Now()
 	results, err := c.submit(context.Background(), []Job{
@@ -723,6 +804,9 @@ func TestSubmit_TimesOutOnStalledPublish(t *testing.T) {
 	}
 	if elapsed := time.Since(start); elapsed > 2*time.Second {
 		t.Fatalf("submit took %v, want it bounded by the submit timeout", elapsed)
+	}
+	if got := rec.incrTags("jack.courier.submit.count"); !hasTag(got, "status:error") || hasTag(got, "status:canceled") {
+		t.Errorf("submit.count tags = %v, want status:error without status:canceled", got)
 	}
 }
 

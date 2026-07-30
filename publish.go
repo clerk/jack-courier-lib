@@ -277,8 +277,15 @@ func (c *courier) submit(ctx context.Context, jobs []Job) (results []SubmitResul
 	// Wrapping the publish error keeps its identity so shutdown cancellation
 	// is not mistaken for a driver failure.
 	if failed == len(jobs) && retryable == failed {
-		_ = c.statsd.Incr("jack.courier.submit.count", []string{"status:error", queueTag}, 1)
 		err := fmt.Errorf("courier: publish batch: all %d jobs failed: %w", len(jobs), firstPubErr)
+		statusTag := "error"
+
+		// context.Canceled is expected during deployments; keep it visible
+		// without inflating the submit error rate.
+		if errors.Is(err, context.Canceled) && errors.Is(ctx.Err(), context.Canceled) {
+			statusTag = "canceled"
+		}
+		_ = c.statsd.Incr("jack.courier.submit.count", []string{"status:" + statusTag, queueTag}, 1)
 		c.reportSubmitFailure(jobs[0].Queue, err)
 		return nil, err
 	}
