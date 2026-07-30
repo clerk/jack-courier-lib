@@ -25,6 +25,9 @@ const (
 	ReasonNotYetDue       = "not_yet_due"
 )
 
+// ErrQueueUnmapped means no topic is configured for a queue.
+var ErrQueueUnmapped = errors.New("courier: no topic configured for queue")
+
 // futureJobLeeway is how far ahead of now a job may be scheduled and still be
 // published immediately. Jobs due further out are held: nothing delays a
 // published message yet (see PLAT-3376), so publishing them would run them
@@ -178,7 +181,7 @@ func (c *courier) submit(ctx context.Context, jobs []Job) (results []SubmitResul
 	for _, job := range jobs {
 		if _, ok := c.publishers[job.Queue]; !ok {
 			_ = c.statsd.Incr("jack.courier.submit.count", []string{"status:error", "queue:" + job.Queue}, 1)
-			err := fmt.Errorf("courier: no topic configured for queue %q", job.Queue)
+			err := fmt.Errorf("%w %q", ErrQueueUnmapped, job.Queue)
 			c.reportSubmitFailure(job.Queue, err)
 			return nil, err
 		}
