@@ -375,6 +375,9 @@ func TestSubmit_UnmappedQueueRejectsBatch(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected batch error for unmapped queue")
 	}
+	if !errors.Is(err, ErrQueueUnmapped) {
+		t.Fatalf("expected ErrQueueUnmapped, got %v", err)
+	}
 	if results != nil {
 		t.Fatalf("expected nil results on batch error, got %v", results)
 	}

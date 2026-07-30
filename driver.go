@@ -77,6 +77,7 @@ type SubmitResult struct {
 // If the batch fails as a whole (e.g. a transport outage where every publish
 // failed retryably), err is non-nil and results is nil. The driver should
 // retry the batch with backoff.
+// If any job uses an unmapped queue, err matches ErrQueueUnmapped.
 //
 // On partial failure, results contains a mix of successful and failed entries.
 // Each result has a `CorrelationID` echoed from the submitted job. Jobs
