@@ -109,6 +109,14 @@ type Driver interface {
 	Run(ctx context.Context, submit SubmitFunc) error
 }
 
+// HealthReporter is optionally implemented by a Driver to report whether its
+// work loops are still making progress. Health must be safe to call
+// concurrently with Run.
+type HealthReporter interface {
+	// Health returns an error if the driver is unhealthy.
+	Health() error
+}
+
 var (
 	driverMu         sync.Mutex
 	registeredDriver Driver
