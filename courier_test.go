@@ -6,6 +6,8 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -357,4 +359,41 @@ type noopDriver struct{}
 func (d *noopDriver) Run(ctx context.Context, submit SubmitFunc) error {
 	<-ctx.Done()
 	return ctx.Err()
+}
+
+// reportingDriver is a noopDriver that also reports a scripted health result.
+type reportingDriver struct {
+	noopDriver
+	health error
+}
+
+func (d *reportingDriver) Health() error { return d.health }
+
+func TestHealthHandler(t *testing.T) {
+	stalled := errors.New(`engine: queue "q" stalled`)
+	tests := []struct {
+		name     string
+		driver   Driver
+		wantCode int
+		wantBody string
+	}{
+		{"unhealthy reporter", &reportingDriver{health: stalled}, http.StatusServiceUnavailable, stalled.Error()},
+		{"healthy reporter", &reportingDriver{}, http.StatusOK, "OK"},
+		{"driver without health", &noopDriver{}, http.StatusOK, "OK"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			rec := httptest.NewRecorder()
+			req := httptest.NewRequest(http.MethodGet, "/health", nil)
+			healthHandler(tt.driver, discardLogger())(rec, req)
+
+			if rec.Code != tt.wantCode {
+				t.Fatalf("status = %d, want %d", rec.Code, tt.wantCode)
+			}
+			if got := strings.TrimSpace(rec.Body.String()); got != tt.wantBody {
+				t.Fatalf("body = %q, want %q", got, tt.wantBody)
+			}
+		})
+	}
 }

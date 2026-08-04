@@ -204,10 +204,7 @@ func run(opts ...Option) int {
 	}
 
 	mux := http.NewServeMux()
-	mux.HandleFunc("GET /health", func(w http.ResponseWriter, _ *http.Request) {
-		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write([]byte("OK"))
-	})
+	mux.HandleFunc("GET /health", healthHandler(driver, c.logger))
 
 	server := &http.Server{
 		Addr:    ":" + port,
@@ -229,6 +226,23 @@ func run(opts ...Option) int {
 	)
 
 	return c.run(ctx, server)
+}
+
+// healthHandler serves GET /health: 503 with the reason when the driver
+// reports unhealthy, 200 otherwise.
+func healthHandler(driver Driver, logger *slog.Logger) http.HandlerFunc {
+	hr, canReport := driver.(HealthReporter)
+	return func(w http.ResponseWriter, _ *http.Request) {
+		if canReport {
+			if err := hr.Health(); err != nil {
+				logger.Error("health check failed", slog.String("error", err.Error()))
+				http.Error(w, err.Error(), http.StatusServiceUnavailable)
+				return
+			}
+		}
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("OK"))
+	}
 }
 
 // run runs the driver and, once it returns or ctx is cancelled, shuts down
