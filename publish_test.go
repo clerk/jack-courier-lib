@@ -885,6 +885,37 @@ func TestBuildPublishers_AppliesSubmitTimeout(t *testing.T) {
 	}
 }
 
+func TestBuildPublishers_AppliesBatchingDefaults(t *testing.T) {
+	// Submit waits for every bundle in the batch, so the client's 100-message
+	// default splits a driver-sized batch into far more RPCs than needed, each
+	// able to stall the whole submit.
+	srv := pstest.NewServer()
+	t.Cleanup(func() { _ = srv.Close() })
+	t.Setenv("PUBSUB_EMULATOR_HOST", srv.Addr)
+
+	c := &courier{
+		project: "test-project",
+		logger:  discardLogger(),
+		statsd:  &statsd.NoOpClient{},
+	}
+	if err := c.buildPublishers(t.Context(), map[string]string{"high": "topic_high"}); err != nil {
+		t.Fatalf("buildPublishers: %v", err)
+	}
+	t.Cleanup(func() { c.stopPublishers(context.Background()) })
+
+	settings := c.publishers["high"].pub.PublishSettings
+	if settings.CountThreshold != publishCountThreshold {
+		t.Errorf("CountThreshold = %d, want %d", settings.CountThreshold, publishCountThreshold)
+	}
+	if settings.DelayThreshold != publishDelayThreshold {
+		t.Errorf("DelayThreshold = %v, want %v", settings.DelayThreshold, publishDelayThreshold)
+	}
+	if settings.ByteThreshold != pubsub.DefaultPublishSettings.ByteThreshold {
+		t.Errorf("ByteThreshold = %d, want the client default %d",
+			settings.ByteThreshold, pubsub.DefaultPublishSettings.ByteThreshold)
+	}
+}
+
 func TestSubmit_FutureJobsMetricSkipsFailures(t *testing.T) {
 	c, _ := newPubsubCourier(t,
 		map[string]string{"high": "topic_high"},

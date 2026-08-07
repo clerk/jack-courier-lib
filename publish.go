@@ -35,6 +35,26 @@ var ErrQueueUnmapped = errors.New("courier: no topic configured for queue")
 // path rather than bouncing them back to the driver for one more round trip.
 const futureJobLeeway = time.Minute
 
+// Publish batching. Submit waits for every message in the batch, so its
+// duration is the slowest bundle, and a batch is split into
+// ceil(len(batch)/publishCountThreshold) bundles — each its own RPC with its
+// own chance of hitting a slow one. The client defaults (100 / 10ms) were
+// sized for callers publishing a message at a time; a driver hands over whole
+// scans, so they split one batch into far more RPCs than necessary.
+//
+// publishCountThreshold matches what the legacy dispatcher has run with. The
+// 1MB byte threshold usually binds first anyway, and the client clamps this to
+// MaxPublishRequestCount.
+//
+// publishDelayThreshold is the floor on any batch that does not fill a bundle.
+// It stays non-zero so a tight publish loop still coalesces into full bundles
+// instead of flushing near-singletons, but small enough not to be a meaningful
+// share of submit time.
+const (
+	publishCountThreshold = 1000
+	publishDelayThreshold = time.Millisecond
+)
+
 // queuePublisher owns the Pub/Sub client for a single queue. Each queue gets
 // its own client — not just its own publisher handle — so one queue's
 // backpressure or connection trouble cannot affect another's.
@@ -72,6 +92,8 @@ func (c *courier) buildPublishers(ctx context.Context, topics map[string]string)
 			return fmt.Errorf("courier: create pubsub client for queue %q: %w", queue, err)
 		}
 		pub := client.Publisher(topic)
+		pub.PublishSettings.CountThreshold = publishCountThreshold
+		pub.PublishSettings.DelayThreshold = publishDelayThreshold
 		// The submit deadline also bounds the client's own publish attempts:
 		// otherwise an abandoned publish keeps retrying in the background
 		// (60s client default) and can land after the driver already
